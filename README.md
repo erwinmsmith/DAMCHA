@@ -53,6 +53,25 @@ DAMCHA/
     └── datasets_nlp.py        # NLP datasets (WMT, CommonGen)
 ```
 
+## Datasets
+
+### CV Datasets
+CIFAR-10 and CIFAR-100 are downloaded automatically via `torchvision` on first run and cached under `data/rawdata/`.
+
+### NLP Datasets
+
+| Dataset | Task | Source |
+|---------|------|--------|
+| **WMT** | Chinese→English Machine Translation | [ModelScope – iic/WMT-Chinese-to-English-Machine-Translation-Training-Corpus](https://www.modelscope.cn/datasets/iic/WMT-Chinese-to-English-Machine-Translation-Training-Corpus) |
+| **CommonGen** | Concept-to-Text Generation | [ModelScope – allenai/common_gen](https://www.modelscope.cn/datasets/allenai/common_gen) |
+
+Download the raw files and place them under the corresponding directories:
+
+```
+data/rawdata/WMT/        # WMT translation corpus
+data/rawdata/CommonGen/  # CommonGen parquet files
+```
+
 ## Installation
 
 ```bash
