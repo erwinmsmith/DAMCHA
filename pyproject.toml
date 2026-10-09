@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "damcha-research"
+version = "0.1.0"
+description = "Data-Adaptive Mahalanobis Cross-Head Attention — accepted at NeurIPS 2026"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "mkdocs>=1.6,<2"]
+
+[project.urls]
+Repository = "https://github.com/erwinmsmith/DAMCHA"
+Documentation = "https://erwinmsmith.github.io/DAMCHA/"
+
+[tool.setuptools]
+packages = ["models", "data"]
+py-modules = ["main", "train", "train_nlp", "utils", "visualization", "evaluation_nlp"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

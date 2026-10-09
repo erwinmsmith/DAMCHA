@@ -55,6 +55,7 @@ class ViTBlock(nn.Module):
         use_mlp: bool = False,
         shared_mlp: Optional[nn.Module] = None,
         off_diag_mode: str = 'mlp',
+        mlp_hidden: Tuple[int, ...] = (256, 512),
     ):
         super().__init__()
         self.use_M = use_M
@@ -67,7 +68,9 @@ class ViTBlock(nn.Module):
                 dropout=dropout,
                 use_M=True,
                 use_mlp=use_mlp,
-                mlp_hidden_dims=(256, 512),  # Will be set properly later
+                mlp_hidden_dims=mlp_hidden,
+                off_diag_mode=off_diag_mode,
+                shared_mlp=shared_mlp,
             )
             # Set shared MLP if provided
             if use_mlp and shared_mlp is not None:
@@ -94,11 +97,11 @@ class ViTBlock(nn.Module):
             nn.Dropout(dropout),
         )
     
-    def forward(self, x):
+    def forward(self, x, head_metrics=None):
         # x: (B, N, d_model)
         if self.use_M:
             # M-attention returns (output, attention_weights)
-            attn_out, _ = self.attn(self.norm1(x))
+            attn_out, _ = self.attn(self.norm1(x), head_metrics=head_metrics)
             x = x + attn_out
         else:
             # Standard attention
@@ -175,12 +178,12 @@ class VisionTransformer(nn.Module):
                 dropout=dropout,
                 use_M=use_M,
                 use_mlp=use_mlp,
-                shared_mlp=None,  # Will be set after creation
+                shared_mlp=shared_mlp,
                 off_diag_mode=off_diag_mode,
+                mlp_hidden=mlp_hidden,
             )
             # Update MLP hidden dims if using M-attention
             if use_M and use_mlp:
-                block.attn._mlp_config['hidden_dims'] = mlp_hidden
                 if shared_mlp is not None:
                     block.attn.set_shared_mlp(shared_mlp)
             self.blocks.append(block)
@@ -219,8 +222,11 @@ class VisionTransformer(nn.Module):
         x = self.pos_drop(x)
         
         # Transformer blocks
+        metrics = None
+        if self.use_M and self.use_mlp and self.share_mlp:
+            metrics = self.blocks[0].attn.mlp_m.head_metrics(x)
         for block in self.blocks:
-            x = block(x)
+            x = block(x, head_metrics=metrics)
         
         # Classification head
         x = self.norm(x)

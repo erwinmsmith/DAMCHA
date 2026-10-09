@@ -19,7 +19,7 @@ from models.transformer_damcha import TransformerPC
 from models.baselines import BaselineTransformer, BASELINE_NAMES
 from utils import (
     AverageMeter, Timer, count_parameters, get_lr,
-    save_checkpoint, MaskGenerator, Patchify
+    save_checkpoint, load_checkpoint, MaskGenerator, Patchify
 )
 from visualization import (
     MetricsLogger, Visualizer,
@@ -185,7 +185,7 @@ class Trainer:
             # Backward and optimize
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                list(self.model.parameters()) + list(self.head.parameters()),
+                list(self.model.parameters()) + list(self.head.parameters()) + list(self.patcher.parameters()),
                 max_norm=1.0
             )
             optimizer.step()
@@ -225,7 +225,7 @@ class Trainer:
             compute_metrics: Whether to compute FID and MSE
 
         Returns:
-            Tuple of (val_loss, val_mse, val_fid, top_mse_fid, top_fid_mse, top_mse_best, top_fid_best, original_imgs, masked_imgs, reconstructed_imgs, per_sample_mse, per_sample_fid)
+            Tuple of (val_loss, val_mse, val_fid, top_mse_fid, top_feature_mse, top_mse_best, top_feature_best, original_imgs, masked_imgs, reconstructed_imgs, per_sample_mse, per_sample_feature_distance)
         """
         self.model.eval()
         self.head.eval()
@@ -292,19 +292,16 @@ class Trainer:
                     first_batch_recon = recon_imgs[:8].cpu()
                     first_batch_masked = masked_imgs[:8].cpu()
             
-            # Limit evaluation batches for speed and memory
-            if batch_idx >= 50:
-                break
         
         val_loss = loss_meter.avg
         val_mse_mean = -1.0; val_mse_q25 = -1.0; val_mse_q75 = -1.0
-        val_fid_mean = -1.0; val_fid_q25 = -1.0; val_fid_q75 = -1.0
+        val_fid_mean = -1.0; val_feature_q25 = -1.0; val_feature_q75 = -1.0
         top_mse_fid = -1.0
-        top_fid_mse = -1.0
+        top_feature_mse = -1.0
         top_mse_best = -1.0
-        top_fid_best = -1.0
+        top_feature_best = -1.0
         per_sample_mse = None
-        per_sample_fid = None
+        per_sample_feature_distance = None
 
         # Compute metrics
         if compute_metrics and len(all_originals) > 0:
@@ -315,20 +312,20 @@ class Trainer:
 
             # Compute per-sample metrics for all samples (always computed)
             print("Computing per-sample metrics for all samples...")
-            per_sample_mse, per_sample_fid = compute_per_sample_metrics(
+            per_sample_mse, per_sample_feature_distance = compute_per_sample_metrics(
                 all_originals, all_reconstructed, self.device
             )
 
             val_mse_mean, val_mse_q25, val_mse_q75 = compute_stats(per_sample_mse)
-            _, val_fid_q25, val_fid_q75 = compute_stats(per_sample_fid)
+            _, val_feature_q25, val_feature_q75 = compute_stats(per_sample_feature_distance)
 
             # Save all samples metrics
-            save_all_samples_metrics(per_sample_mse, per_sample_fid, self.metrics_save_dir, epoch)
+            save_all_samples_metrics(per_sample_mse, per_sample_feature_distance, self.metrics_save_dir, epoch)
 
             # Compute Top-K metrics if enabled
             if self.compute_topk_metrics:
                 print(f"Computing Top-{self.top_k_samples} metrics...")
-                top_mse_fid, top_fid_mse, top_mse_best, top_fid_best, detailed_info = compute_topk_metrics(
+                top_mse_fid, top_feature_mse, top_mse_best, top_feature_best, detailed_info = compute_topk_metrics(
                     all_originals, all_reconstructed, self.top_k_samples, self.device
                 )
 
@@ -336,16 +333,16 @@ class Trainer:
                 save_topk_samples_data(detailed_info, self.metrics_save_dir, epoch)
 
                 print(f"  Top-{self.top_k_samples} MSE samples FID: {top_mse_fid:.2f}")
-                print(f"  Top-{self.top_k_samples} FID samples MSE: {top_fid_mse:.6f}")
+                print(f"  Top-{self.top_k_samples} Feature-distance samples MSE: {top_feature_mse:.6f}")
                 print(f"  Best single MSE: {top_mse_best:.6f}")
-                print(f"  Best single FID: {top_fid_best:.2f}")
+                print(f"  Best single feature distance: {top_feature_best:.2f}")
 
         return (val_loss,
                 val_mse_mean, val_mse_q25, val_mse_q75,
-                val_fid_mean, val_fid_q25, val_fid_q75,
-                top_mse_fid, top_fid_mse, top_mse_best, top_fid_best,
+                val_fid_mean, val_feature_q25, val_feature_q75,
+                top_mse_fid, top_feature_mse, top_mse_best, top_feature_best,
                 first_batch_orig, first_batch_masked, first_batch_recon,
-                per_sample_mse, per_sample_fid)
+                per_sample_mse, per_sample_feature_distance)
     
     def _reconstruct_images_from_patches(
         self,
@@ -423,80 +420,27 @@ def modify_model_scales(model, diag_scale, off_diag_scale):
     return modified
 
 
-def run_block_ablation_evaluation(
-    model: TransformerPC,
-    trainer: 'Trainer',
-    val_loader: DataLoader,
-    config: dict,
-    metrics_dir: str,
-    device: str,
-):
-    """
-    Run block ablation evaluation with diagonal-only and off-diagonal-only M matrix.
-    
-    Args:
-        model: Trained TransformerPC model
-        trainer: Trainer instance with patcher and head
-        val_loader: Validation data loader
-        config: Training configuration
-        metrics_dir: Directory to save metrics
-        device: Device for computation
-    """
+def run_block_ablation_evaluation(model, trainer, val_loader, config, metrics_dir, device):
+    """Compare metric blocks with identical validation masks."""
     import json
-    import numpy as np
-    
-    # Store original scales
-    original_diag_scale = config.get('diag_scale', 1.0)
-    original_off_diag_scale = config.get('off_diag_scale', 0.5)
-    
+    original = (config.get('diag_scale', 1.0), config.get('off_diag_scale', 1.0))
+    keys = ['val_loss', 'val_mse_mean', 'val_mse_q25', 'val_mse_q75',
+            'val_fid_mean', 'val_feature_q25', 'val_feature_q75',
+            'top_mse_fid', 'top_feature_mse', 'top_mse_best', 'top_feature_best']
     results = {}
-    
-    # Evaluate with diagonal-only (diag_scale=1.0, off_diag_scale=0.0)
-    print("\n[Diagonal-only] Evaluating with diag_scale=1.0, off_diag_scale=0.0...")
-    modify_model_scales(model, diag_scale=1.0, off_diag_scale=0.0)
-    
-    (diag_loss,
-     diag_mse_mean, diag_mse_q25, diag_mse_q75,
-     diag_fid_mean, diag_fid_q25, diag_fid_q75,
-     _, _, diag_top_mse_best, diag_top_fid_best,
-     _, _, _, _, _) = trainer.evaluate(val_loader, epoch=-1, compute_metrics=True)
-    
-    results['diagonal_only'] = {
-        'val_loss': float(diag_loss),
-        'val_mse_mean': float(diag_mse_mean), 'val_mse_q25': float(diag_mse_q25), 'val_mse_q75': float(diag_mse_q75),
-        'val_fid_mean': float(diag_fid_mean), 'val_fid_q25': float(diag_fid_q25), 'val_fid_q75': float(diag_fid_q75),
-        'top_mse_best': float(diag_top_mse_best), 'top_fid_best': float(diag_top_fid_best),
-    }
-    print(f"  val_fid_mean: {diag_fid_mean:.2f} [Q25={diag_fid_q25:.2f}, Q75={diag_fid_q75:.2f}]")
-    
-    # Evaluate with off-diagonal-only (diag_scale=0.0, off_diag_scale=1.0)
-    print("\n[Off-diagonal-only] Evaluating with diag_scale=0.0, off_diag_scale=1.0...")
-    modify_model_scales(model, diag_scale=0.0, off_diag_scale=1.0)
-    
-    (offdiag_loss,
-     offdiag_mse_mean, offdiag_mse_q25, offdiag_mse_q75,
-     offdiag_fid_mean, offdiag_fid_q25, offdiag_fid_q75,
-     _, _, offdiag_top_mse_best, offdiag_top_fid_best,
-     _, _, _, _, _) = trainer.evaluate(val_loader, epoch=-1, compute_metrics=True)
-    
-    results['offdiag_only'] = {
-        'val_loss': float(offdiag_loss),
-        'val_mse_mean': float(offdiag_mse_mean), 'val_mse_q25': float(offdiag_mse_q25), 'val_mse_q75': float(offdiag_mse_q75),
-        'val_fid_mean': float(offdiag_fid_mean), 'val_fid_q25': float(offdiag_fid_q25), 'val_fid_q75': float(offdiag_fid_q75),
-        'top_mse_best': float(offdiag_top_mse_best), 'top_fid_best': float(offdiag_top_fid_best),
-    }
-    print(f"  val_fid_mean: {offdiag_fid_mean:.2f} [Q25={offdiag_fid_q25:.2f}, Q75={offdiag_fid_q75:.2f}]")
-    
-    # Restore original scales
-    modify_model_scales(model, diag_scale=original_diag_scale, off_diag_scale=original_off_diag_scale)
-    
-    # Save results
-    results_file = os.path.join(metrics_dir, 'block_ablation_results.json')
-    with open(results_file, 'w') as f:
+    devices = [torch.device(device).index or 0] if str(device).startswith('cuda') else []
+    try:
+        for epoch, (name, diag, off) in enumerate([
+                ('diagonal_only', 1., 0.), ('offdiag_only', 0., 1.)], start=1):
+            modify_model_scales(model, diag, off)
+            with torch.random.fork_rng(devices=devices):
+                values = trainer.evaluate(val_loader, epoch=-epoch, compute_metrics=True)
+            results[name] = dict(zip(keys, (float(v) for v in values[:len(keys)])))
+    finally:
+        modify_model_scales(model, *original)
+    with open(os.path.join(metrics_dir, 'block_ablation_results.json'), 'w') as f:
         json.dump(results, f, indent=2)
-    
-    print(f"\nBlock ablation results saved to: {results_file}")
-    print("="*80)
+    return results
 
 
 def build_model(
@@ -616,7 +560,7 @@ def train(
             else:
                 mode_name = f'mlp_separate_{off_diag_mode}{depth_suffix}{multihead_suffix}{compact_suffix}{free_suffix}'
     else:
-        mode_name = 'M0_only'   # M0-only attention
+        mode_name = 'static_metric'   # Static-metric attention
     
     # Initialize visualization and metrics logging with dataset and mode-specific paths
     # Directory structure: outputs/{dataset}/visualizations/{mode}/
@@ -626,6 +570,10 @@ def train(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_mode = mode_name.replace('/', '_')
     experiment_name = f"{safe_mode}_{timestamp}"
+    if config.get('resume'):
+        previous = torch.load(config['resume'], map_location='cpu', weights_only=True)
+        experiment_name = previous.get('config', {}).get('experiment_name', experiment_name)
+    config['experiment_name'] = experiment_name
     
     # Create dataset and mode-specific output directories
     # outputs/{dataset}/visualizations/{mode}/ and outputs/{dataset}/metrics/{mode}/
@@ -642,7 +590,8 @@ def train(
     
     metrics_logger = MetricsLogger(
         save_dir=metrics_dir,
-        experiment_name=experiment_name
+        experiment_name=experiment_name,
+        resume=bool(config.get("resume")),
     )
     
     print(f"\n[Output Directories]")
@@ -665,9 +614,9 @@ def train(
         baseline=config.get('baseline'),
         off_diag_mode=config.get('off_diag_mode', 'mlp'),
         diag_scale=config.get('diag_scale', 1.0),
-        off_diag_scale=config.get('off_diag_scale', 0.5),
+        off_diag_scale=config.get('off_diag_scale', 1.0),
         off_diag_alpha_init=config.get('off_diag_alpha_init', 0.1),
-        use_layer_bias=config.get('use_layer_bias', True),
+        use_layer_bias=config.get('use_layer_bias', False),
         layer_bias_rank=config.get('layer_bias_rank', 16),
         dev_mode=dev_mode,
         device=device,
@@ -706,8 +655,8 @@ def train(
     print(f"  Dev mode: {dev_mode}\n")
     
     # Optimizer
-    optimizer = optim.AdamW(
-        list(model.parameters()) + list(head.parameters()),
+    optimizer = optim.Adam(
+        list(model.parameters()) + list(head.parameters()) + list(patcher.parameters()),
         lr=config['lr'],
         weight_decay=config['weight_decay']
     )
@@ -732,10 +681,12 @@ def train(
         kl_weight=config.get('kl_weight', 1e-4),
     )
     
-    # Training loop
     best_val_loss = float('inf')
-    
-    for epoch in range(1, config['epochs'] + 1):
+    start_epoch = 0
+    if config.get('resume'):
+        start_epoch, best_val_loss = load_checkpoint(model, optimizer, config['resume'], device,
+            components={'head': head, 'patcher': patcher}, scheduler=scheduler)
+    for epoch in range(start_epoch + 1, config['epochs'] + 1):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch}/{config['epochs']}")
         print(f"{'='*60}")
@@ -750,17 +701,17 @@ def train(
         # Validation with metrics
         (val_loss,
          val_mse_mean, val_mse_q25, val_mse_q75,
-         val_fid_mean, val_fid_q25, val_fid_q75,
-         top_mse_fid, top_fid_mse, top_mse_best, top_fid_best,
+         val_fid_mean, val_feature_q25, val_feature_q75,
+         top_mse_fid, top_feature_mse, top_mse_best, top_feature_best,
          orig_imgs, masked_imgs, recon_imgs, _, _) = trainer.evaluate(
             val_loader, epoch=epoch, compute_metrics=True
         )
         print(f"Validation - Loss: {val_loss:.4f}, "
               f"MSE: {val_mse_mean:.4f} [Q25={val_mse_q25:.4f}, Q75={val_mse_q75:.4f}], "
-              f"FID: {val_fid_mean:.4f} [Q25={val_fid_q25:.4f}, Q75={val_fid_q75:.4f}]")
+              f"FID: {val_fid_mean:.4f}, feature distance [Q25={val_feature_q25:.4f}, Q75={val_feature_q75:.4f}]")
         if config['compute_topk_metrics']:
-            print(f"Top-50 - MSE samples FID: {top_mse_fid:.4f}, FID samples MSE: {top_fid_mse:.6f}")
-            print(f"Best Single - MSE: {top_mse_best:.6f}, FID: {top_fid_best:.4f}")
+            print(f"Top-50 - MSE samples FID: {top_mse_fid:.4f}, Feature-distance samples MSE: {top_feature_mse:.6f}")
+            print(f"Best Single - MSE: {top_mse_best:.6f}, feature distance: {top_feature_best:.4f}")
         
         # Get M* matrices for visualization
         M_star_matrices = model.get_M_matrices()
@@ -788,13 +739,13 @@ def train(
             'val_mse_q25':  val_mse_q25,
             'val_mse_q75':  val_mse_q75,
             'val_fid_mean': val_fid_mean,
-            'val_fid_q25':  val_fid_q25,
-            'val_fid_q75':  val_fid_q75,
+            'val_feature_q25':  val_feature_q25,
+            'val_feature_q75':  val_feature_q75,
             'learning_rate': get_lr(optimizer),
             'top_mse_fid':  top_mse_fid,
-            'top_fid_mse':  top_fid_mse,
+            'top_feature_mse':  top_feature_mse,
             'top_mse_best': top_mse_best,
-            'top_fid_best': top_fid_best,
+            'top_feature_best': top_feature_best,
         }
 
         metrics_logger.log_epoch(metrics_dict)
@@ -813,7 +764,9 @@ def train(
             best_val_loss = val_loss
             save_checkpoint(
                 model, optimizer, epoch, val_loss,
-                os.path.join(save_dir, 'best_model.pt')
+                os.path.join(save_dir, 'best_model.pt'),
+                components={'head': head, 'patcher': patcher}, scheduler=scheduler,
+                config=config, best_loss=best_val_loss
             )
             print(f"Best model saved (val_loss: {val_loss:.4f})")
         
@@ -821,7 +774,9 @@ def train(
         if epoch % config['save_every'] == 0:
             save_checkpoint(
                 model, optimizer, epoch, val_loss,
-                os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pt')
+                os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pt'),
+                components={'head': head, 'patcher': patcher}, scheduler=scheduler,
+                config=config, best_loss=best_val_loss
             )
     
     print(f"\nTraining completed! Best validation loss: {best_val_loss:.4f}")

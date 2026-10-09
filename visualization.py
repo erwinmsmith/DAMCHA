@@ -24,7 +24,7 @@ class MetricsLogger:
     Saves metrics incrementally after each epoch.
     """
     
-    def __init__(self, save_dir: str, experiment_name: str = None):
+    def __init__(self, save_dir: str, experiment_name: str = None, resume: bool = False):
         """
         Initialize metrics logger.
         
@@ -46,14 +46,14 @@ class MetricsLogger:
             'epoch', 'train_loss', 'train_time',
             'val_loss',
             'val_mse_mean', 'val_mse_q25', 'val_mse_q75',
-            'val_fid_mean', 'val_fid_q25', 'val_fid_q75',
+            'val_fid_mean', 'val_feature_q25', 'val_feature_q75',
             'learning_rate', 'timestamp',
-            'top_mse_fid', 'top_fid_mse', 'top_mse_best', 'top_fid_best'
+            'top_mse_fid', 'top_feature_mse', 'top_mse_best', 'top_feature_best'
         ]
         
-        with open(self.csv_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=self.headers)
-            writer.writeheader()
+        if not (resume and self.csv_path.exists()):
+            with open(self.csv_path, 'w', newline='') as f:
+                csv.DictWriter(f, fieldnames=self.headers).writeheader()
         
         print(f"Metrics will be saved to: {self.csv_path}")
     
@@ -384,16 +384,13 @@ class Visualizer:
         
         # Plot 3: FID (mean ± IQR)
         val_fid_mean = [m.get('val_fid_mean', None) for m in metrics_history]
-        val_fid_q25  = [m.get('val_fid_q25',  None) for m in metrics_history]
-        val_fid_q75  = [m.get('val_fid_q75',  None) for m in metrics_history]
+        val_feature_q25  = [m.get('val_feature_q25',  None) for m in metrics_history]
+        val_feature_q75  = [m.get('val_feature_q75',  None) for m in metrics_history]
         if any(v is not None for v in val_fid_mean):
             axes[1, 0].plot(epochs, val_fid_mean, 'o-', color='red', label='mean')
-            if any(v is not None for v in val_fid_q25):
-                axes[1, 0].fill_between(epochs, val_fid_q25, val_fid_q75,
-                                        alpha=0.25, color='red', label='Q25-Q75')
             axes[1, 0].set_xlabel('Epoch')
             axes[1, 0].set_ylabel('FID')
-            axes[1, 0].set_title('Validation FID (mean ± IQR)')
+            axes[1, 0].set_title('Validation distribution FID')
             axes[1, 0].legend()
             axes[1, 0].grid(True, alpha=0.3)
         
@@ -417,122 +414,51 @@ class Visualizer:
         print(f"Saved training curves: {save_path}")
 
 
-def compute_fid_score(
-    real_images: torch.Tensor,
-    generated_images: torch.Tensor,
-    device: str = 'cuda',
-    batch_size: int = 64
-) -> float:
-    """
-    Compute Frechet Inception Distance (FID) using InceptionV3 features.
-    
-    Uses torchvision's pretrained InceptionV3 to extract features,
-    then computes FID between real and generated image distributions.
-    
-    Args:
-        real_images: Real images [B, C, H, W] (normalized to [-1, 1])
-        generated_images: Generated images [B, C, H, W] (normalized to [-1, 1])
-        device: Device for computation
-        batch_size: Batch size for feature extraction
-        
-    Returns:
-        FID score (lower is better), or -1.0 if computation fails
-    """
-    try:
-        from scipy import linalg
-        from torchvision import models
-        import torch.nn.functional as F
-        
-        # Load InceptionV3 pretrained model
-        inception = models.inception_v3(weights=models.Inception_V3_Weights.DEFAULT, transform_input=False)
-        inception.fc = torch.nn.Identity()  # Remove final FC layer to get features
-        inception = inception.to(device)
-        inception.eval()
-        
-        def get_inception_features(images: torch.Tensor) -> np.ndarray:
-            """Extract InceptionV3 features from images."""
-            # Move to device first
-            images = images.to(device)
-            
-            # Denormalize from [-1, 1] to [0, 1]
-            images = (images + 1) / 2
-            images = images.clamp(0, 1)
-            
-            # Resize to InceptionV3 input size (299x299)
-            images = F.interpolate(images, size=(299, 299), mode='bilinear', align_corners=False)
-            
-            # Normalize with ImageNet stats
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
-            images = (images - mean) / std
-            
-            features = []
-            with torch.no_grad():
-                for i in range(0, len(images), batch_size):
-                    batch = images[i:i+batch_size]
-                    feat = inception(batch)
-                    features.append(feat.cpu().numpy())
-            
-            return np.concatenate(features, axis=0)
-        
-        # Extract features
-        real_features = get_inception_features(real_images)
-        gen_features = get_inception_features(generated_images)
-        
-        # Limit samples for efficiency
-        max_samples = 1000
-        if real_features.shape[0] > max_samples:
-            idx = np.random.choice(real_features.shape[0], max_samples, replace=False)
-            real_features = real_features[idx]
-            gen_features = gen_features[idx]
-        
-        # Compute statistics
-        mu_real = np.mean(real_features, axis=0)
-        sigma_real = np.cov(real_features, rowvar=False)
-        
-        mu_gen = np.mean(gen_features, axis=0)
-        sigma_gen = np.cov(gen_features, rowvar=False)
-        
-        # Ensure covariance matrices are 2D
-        if sigma_real.ndim == 0:
-            sigma_real = np.array([[sigma_real]])
-        if sigma_gen.ndim == 0:
-            sigma_gen = np.array([[sigma_gen]])
-        
-        # Compute FID: ||mu_real - mu_gen||^2 + Tr(sigma_real + sigma_gen - 2*sqrt(sigma_real*sigma_gen))
-        diff = mu_real - mu_gen
-        covmean, _ = linalg.sqrtm(sigma_real.dot(sigma_gen), disp=False)
-        
-        if np.iscomplexobj(covmean):
-            covmean = covmean.real
-        
-        fid = diff.dot(diff) + np.trace(sigma_real + sigma_gen - 2 * covmean)
-        
-        return float(fid)
-    
-    except Exception as e:
-        print(f"Warning: FID computation failed: {e}")
-        return -1.0
+_INCEPTION_CACHE = {}
 
 
-def compute_stats(values: torch.Tensor) -> Tuple[float, float, float]:
-    """
-    Compute mean, Q25, Q75 from a 1D tensor of per-sample values.
-    Ignores negative sentinel values (-1.0).
+@torch.no_grad()
+def _inception_features(images, device, batch_size=64):
+    from torchvision.models import inception_v3, Inception_V3_Weights
+    import torch.nn.functional as F
+    key = str(device)
+    if key not in _INCEPTION_CACHE:
+        model = inception_v3(weights=Inception_V3_Weights.DEFAULT, transform_input=False)
+        model.fc = torch.nn.Identity()
+        _INCEPTION_CACHE[key] = model.to(device).eval()
+    model = _INCEPTION_CACHE[key]
+    features = []
+    for batch in images.split(batch_size):
+        batch = ((batch.to(device) + 1) / 2).clamp(0, 1)
+        if batch.size(1) == 1:
+            batch = batch.repeat(1, 3, 1, 1)
+        batch = F.interpolate(batch, (299, 299), mode='bilinear', align_corners=False)
+        mean = batch.new_tensor([.485, .456, .406])[None, :, None, None]
+        std = batch.new_tensor([.229, .224, .225])[None, :, None, None]
+        features.append(model((batch - mean) / std).cpu())
+    return torch.cat(features)
 
-    Returns:
-        Tuple of (mean, q25, q75), each -1.0 on failure.
-    """
-    try:
-        valid = values[values >= 0].float()
-        if len(valid) == 0:
-            return -1.0, -1.0, -1.0
-        mean = valid.mean().item()
-        q25 = torch.quantile(valid, 0.25).item()
-        q75 = torch.quantile(valid, 0.75).item()
-        return mean, q25, q75
-    except Exception:
-        return -1.0, -1.0, -1.0
+
+def compute_fid_score(real_images, generated_images, device='cuda', batch_size=64):
+    """Distribution FID from torchvision Inception-v3 ImageNet features."""
+    from scipy.linalg import sqrtm
+    if len(real_images) < 2 or len(generated_images) < 2:
+        raise ValueError('FID needs at least two real and two generated images')
+    real = _inception_features(real_images, device, batch_size).double().numpy()
+    generated = _inception_features(generated_images, device, batch_size).double().numpy()
+    difference = real.mean(0) - generated.mean(0)
+    cov_real, cov_generated = np.cov(real, rowvar=False), np.cov(generated, rowvar=False)
+    covariance_mean = sqrtm(cov_real @ cov_generated).real
+    value = difference @ difference + np.trace(cov_real + cov_generated - 2 * covariance_mean)
+    return max(float(value), 0.0)
+
+
+def compute_stats(values):
+    """Mean and quartiles of finite, nonnegative per-example measurements."""
+    valid = values[torch.isfinite(values) & (values >= 0)].float()
+    if valid.numel() == 0:
+        return float('nan'), float('nan'), float('nan')
+    return valid.mean().item(), valid.quantile(.25).item(), valid.quantile(.75).item()
 
 
 def compute_mse(
@@ -553,84 +479,14 @@ def compute_mse(
     return mse.item()
 
 
-def compute_per_sample_metrics(
-    real_images: torch.Tensor,
-    reconstructed_images: torch.Tensor,
-    device: str = 'cuda',
-    batch_size: int = 32
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute MSE and FID for each sample individually.
-
-    Args:
-        real_images: Real images [B, C, H, W]
-        reconstructed_images: Reconstructed images [B, C, H, W]
-        device: Device for computation
-        batch_size: Batch size for FID computation
-
-    Returns:
-        Tuple of (per_sample_mse, per_sample_fid)
-    """
-    B = real_images.size(0)
-
-    # Compute per-sample MSE
-    per_sample_mse = torch.nn.functional.mse_loss(
-        reconstructed_images, real_images, reduction='none'
-    ).mean(dim=[1, 2, 3])  # [B]
-
-    # For FID, we need to compute features for each sample
-    per_sample_fid = torch.full((B,), -1.0, device=real_images.device)
-
-    try:
-        from torchvision.models import inception_v3
-        from scipy import linalg
-        import numpy as np
-
-        # Load InceptionV3 for feature extraction
-        from torchvision.models import Inception_V3_Weights
-        inception = inception_v3(weights=Inception_V3_Weights.DEFAULT, transform_input=False)
-        inception.eval()
-        inception.fc = torch.nn.Identity()  # Remove final classification layer
-        inception.to(device)
-
-        # Process images in batches for FID computation
-        for i in range(0, B, batch_size):
-            batch_end = min(i + batch_size, B)
-            batch_real = real_images[i:batch_end].to(device)
-            batch_recon = reconstructed_images[i:batch_end].to(device)
-
-            # Normalize to [0, 1] for InceptionV3
-            batch_real = (batch_real + 1.0) / 2.0
-            batch_recon = (batch_recon + 1.0) / 2.0
-
-            # Resize to 299x299 for InceptionV3
-            batch_real = torch.nn.functional.interpolate(
-                batch_real, size=(299, 299), mode='bilinear', align_corners=False
-            )
-            batch_recon = torch.nn.functional.interpolate(
-                batch_recon, size=(299, 299), mode='bilinear', align_corners=False
-            )
-
-            with torch.no_grad():
-                # Extract features
-                features_real = inception(batch_real).cpu().numpy()  # [batch, 2048]
-                features_recon = inception(batch_recon).cpu().numpy()
-
-                # Compute FID for each sample in the batch
-                for j in range(features_real.shape[0]):
-                    mu_real = features_real[j:j+1].mean(axis=0)
-                    mu_recon = features_recon[j:j+1].mean(axis=0)
-
-                    # For single samples, we treat the sample as its own distribution
-                    # This is a simplified FID approximation
-                    fid = np.sum((mu_real - mu_recon) ** 2)
-                    per_sample_fid[i + j] = float(fid)
-
-    except Exception as e:
-        print(f"Warning: Per-sample FID computation failed: {e}")
-        # Keep -1.0 values for per_sample_fid
-
-    return per_sample_mse, per_sample_fid
+def compute_per_sample_metrics(real_images, reconstructed_images, device='cuda', batch_size=64):
+    """Return pixel MSE and squared Inception feature distance for each pair."""
+    mse = torch.nn.functional.mse_loss(reconstructed_images, real_images,
+                                      reduction='none').mean(dim=(1, 2, 3))
+    real = _inception_features(real_images, device, batch_size)
+    reconstructed = _inception_features(reconstructed_images, device, batch_size)
+    distance = (real - reconstructed).square().sum(-1).to(mse.device)
+    return mse, distance
 
 
 def compute_topk_metrics(
@@ -640,7 +496,7 @@ def compute_topk_metrics(
     device: str = 'cuda'
 ) -> Tuple[float, float, float, float, Dict]:
     """
-    Compute Top-K metrics: Top-MSE FID and Top-FID MSE.
+    Compute Top-K metrics: Top-MSE FID and Top-feature-distance MSE.
 
     Args:
         real_images: Real images [B, C, H, W]
@@ -649,7 +505,7 @@ def compute_topk_metrics(
         device: Device for computation
 
     Returns:
-        Tuple of (top_mse_fid, top_fid_mse, top_mse_best, top_fid_best, detailed_info)
+        Tuple of (top_mse_fid, top_feature_mse, top_mse_best, top_feature_best, detailed_info)
         where detailed_info contains indices and values for analysis
     """
     B = real_images.size(0)
@@ -658,7 +514,7 @@ def compute_topk_metrics(
     top_k = min(top_k, B)
 
     # Compute per-sample metrics
-    per_sample_mse, per_sample_fid = compute_per_sample_metrics(
+    per_sample_mse, per_sample_feature_distance = compute_per_sample_metrics(
         real_images, reconstructed_images, device
     )
 
@@ -666,9 +522,9 @@ def compute_topk_metrics(
     mse_sorted_indices = torch.argsort(per_sample_mse)
     top_mse_indices = mse_sorted_indices[:top_k]
 
-    # Sort by FID (ascending - lower FID is better)
-    fid_sorted_indices = torch.argsort(per_sample_fid)
-    top_fid_indices = fid_sorted_indices[:top_k]
+    # Rank paired feature distances in ascending order.
+    feature_sorted_indices = torch.argsort(per_sample_feature_distance)
+    top_feature_indices = feature_sorted_indices[:top_k]
 
     # Compute metrics for top-MSE samples
     top_mse_images_real = real_images[top_mse_indices]
@@ -679,30 +535,30 @@ def compute_topk_metrics(
         top_mse_images_real, top_mse_images_recon, device
     )
 
-    # Compute metrics for top-FID samples
-    top_fid_images_real = real_images[top_fid_indices]
-    top_fid_images_recon = reconstructed_images[top_fid_indices]
+    # Compute metrics for top-feature-distance samples
+    top_feature_images_real = real_images[top_feature_indices]
+    top_feature_images_recon = reconstructed_images[top_feature_indices]
 
-    # Compute overall MSE for top-FID samples
-    top_fid_mse = compute_mse(top_fid_images_real, top_fid_images_recon)
+    # Compute overall MSE for top-feature-distance samples
+    top_feature_mse = compute_mse(top_feature_images_real, top_feature_images_recon)
 
     # Get the best single sample metrics
     top_mse_best = per_sample_mse[top_mse_indices[0]].item()  # Best MSE (lowest)
-    top_fid_best = per_sample_fid[top_fid_indices[0]].item()  # Best FID (lowest)
+    top_feature_best = per_sample_feature_distance[top_feature_indices[0]].item()  # Smallest feature distance
 
     # Prepare detailed information for saving
     detailed_info = {
         'top_mse_indices': top_mse_indices.cpu().numpy().tolist(),
-        'top_fid_indices': top_fid_indices.cpu().numpy().tolist(),
+        'top_feature_indices': top_feature_indices.cpu().numpy().tolist(),
         'top_mse_values': per_sample_mse[top_mse_indices].cpu().numpy().tolist(),
-        'top_fid_values': per_sample_fid[top_fid_indices].cpu().numpy().tolist(),
-        'top_mse_fid_values': per_sample_fid[top_mse_indices].cpu().numpy().tolist(),
-        'top_fid_mse_values': per_sample_mse[top_fid_indices].cpu().numpy().tolist(),
+        'top_feature_values': per_sample_feature_distance[top_feature_indices].cpu().numpy().tolist(),
+        'top_mse_feature_values': per_sample_feature_distance[top_mse_indices].cpu().numpy().tolist(),
+        'top_feature_mse_values': per_sample_mse[top_feature_indices].cpu().numpy().tolist(),
         'top_mse_best': top_mse_best,
-        'top_fid_best': top_fid_best,
+        'top_feature_best': top_feature_best,
     }
 
-    return top_mse_fid, top_fid_mse, top_mse_best, top_fid_best, detailed_info
+    return top_mse_fid, top_feature_mse, top_mse_best, top_feature_best, detailed_info
 
 
 def save_topk_samples_data(
@@ -735,16 +591,16 @@ def save_topk_samples_data(
 
 def save_all_samples_metrics(
     per_sample_mse: torch.Tensor,
-    per_sample_fid: torch.Tensor,
+    per_sample_feature_distance: torch.Tensor,
     save_path: str,
     epoch: int
 ):
     """
-    Save all per-sample metrics (MSE, FID) for each epoch.
+    Save all per-sample metrics (MSE, feature distance) for each epoch.
 
     Args:
         per_sample_mse: Per-sample MSE values [B]
-        per_sample_fid: Per-sample FID values [B]
+        per_sample_feature_distance: Per-sample feature distances [B]
         save_path: Directory to save the data
         epoch: Current epoch number
     """
@@ -756,22 +612,22 @@ def save_all_samples_metrics(
 
     # Convert tensors to lists
     mse_list = per_sample_mse.cpu().numpy().tolist()
-    fid_list = per_sample_fid.cpu().numpy().tolist()
+    feature_list = per_sample_feature_distance.cpu().numpy().tolist()
 
     # Prepare data
     all_samples_data = {
         'epoch': epoch,
         'num_samples': len(mse_list),
         'per_sample_mse': mse_list,
-        'per_sample_fid': fid_list,
+        'per_sample_feature_distance': feature_list,
         'mean_mse': float(np.mean(mse_list)),
-        'mean_fid': float(np.mean([f for f in fid_list if f >= 0])),  # Exclude failed FID (-1)
+        'mean_feature_distance': float(np.mean([f for f in feature_list if f >= 0])),  # Exclude failed FID (-1)
         'std_mse': float(np.std(mse_list)),
-        'std_fid': float(np.std([f for f in fid_list if f >= 0])),
+        'std_feature_distance': float(np.std([f for f in feature_list if f >= 0])),
         'min_mse': float(np.min(mse_list)),
         'max_mse': float(np.max(mse_list)),
-        'min_fid': float(np.min([f for f in fid_list if f >= 0])) if any(f >= 0 for f in fid_list) else -1.0,
-        'max_fid': float(np.max([f for f in fid_list if f >= 0])) if any(f >= 0 for f in fid_list) else -1.0,
+        'min_feature_distance': float(np.min([f for f in feature_list if f >= 0])) if any(f >= 0 for f in feature_list) else -1.0,
+        'max_feature_distance': float(np.max([f for f in feature_list if f >= 0])) if any(f >= 0 for f in feature_list) else -1.0,
     }
 
     # Save as JSON

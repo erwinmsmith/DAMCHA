@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use DAMCHA, please cite the paper below."
+title: "DAMCHA: Data-Adaptive Mahalanobis Cross-Head Attention"
+type: software
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/erwinmsmith/DAMCHA"
+url: "https://erwinmsmith.github.io/DAMCHA/"
+authors: &authors
+  - family-names: Duan
+    given-names: Zhenke
+  - family-names: Li
+    given-names: Xin
+  - family-names: Pan
+    given-names: Jiqun
+  - name: Dong Xiaofei
+  - family-names: Ning
+    given-names: Hanwen
+  - family-names: Song
+    given-names: Xinyuan
+preferred-citation:
+  type: conference-paper
+  title: "Data-Adaptive Mahalanobis Metric Learning for Cross-Head Attention in Transformers"
+  authors: *authors
+  collection-title: "Advances in Neural Information Processing Systems"
+  year: 2026
+  notes: "Accepted at NeurIPS 2026"

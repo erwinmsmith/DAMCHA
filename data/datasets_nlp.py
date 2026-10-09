@@ -2,7 +2,7 @@
 NLP Dataset loaders for DAMCHA experiments.
 
 Supports:
-- WMT (Chinese-English Machine Translation)
+- WMT14 (English-German Machine Translation)
 - CNN/DailyMail (Summarization)
 - CommonGen (Concept-to-Text Generation)
 """
@@ -109,105 +109,32 @@ def collate_seq2seq(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 # WMT Chinese-English Dataset
 # =============================================================================
 
-def load_wmt_data(
-    data_dir: str,
-    max_samples: int = None,
-) -> Tuple[List[str], List[str]]:
-    """
-    Load WMT Chinese-English translation data.
-    
-    Args:
-        data_dir: Path to WMT data directory
-        max_samples: Maximum number of samples to load (None for all)
-        
-    Returns:
-        Tuple of (chinese_texts, english_texts)
-    """
-    csv_path = os.path.join(data_dir, 'WMT', 'wmt_zh_en_training_corpus.csv')
-    
-    chinese_texts = []
-    english_texts = []
-    
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        reader = csv.reader(f)
-        next(reader)  # Skip header
-        for i, row in enumerate(reader):
-            if max_samples and i >= max_samples:
-                break
-            if len(row) >= 2:
-                chinese_texts.append(row[0])
-                english_texts.append(row[1])
-    
-    return chinese_texts, english_texts
+def load_wmt_data(data_dir, max_samples=None, split='train'):
+    """Read WMT14 English -> German parallel files: WMT14/{split}.en/.de."""
+    from pathlib import Path
+    folder = Path(data_dir) / 'WMT14'
+    sources = (folder / f'{split}.en').read_text(encoding='utf-8').splitlines()
+    targets = (folder / f'{split}.de').read_text(encoding='utf-8').splitlines()
+    if len(sources) != len(targets) or not sources:
+        raise ValueError(f'WMT14 {split}: English and German files must contain equal, nonzero line counts')
+    if max_samples is not None:
+        sources, targets = sources[:max_samples], targets[:max_samples]
+    return sources, targets
 
 
-def get_wmt_dataloader(
-    data_dir: str,
-    tokenizer_name: str = 'bert-base-multilingual-cased',
-    batch_size: int = 32,
-    max_source_len: int = 128,
-    max_target_len: int = 128,
-    num_workers: int = 4,
-    train_split: float = 0.9,
-    max_samples: int = 100000,  # Limit samples for faster training
-) -> Tuple[DataLoader, DataLoader]:
-    """
-    Create WMT data loaders.
-    
-    Args:
-        data_dir: Directory containing WMT data
-        tokenizer_name: HuggingFace tokenizer name
-        batch_size: Batch size
-        max_source_len: Maximum source sequence length
-        max_target_len: Maximum target sequence length
-        num_workers: Number of data loading workers
-        train_split: Train/val split ratio
-        max_samples: Maximum samples to use
-        
-    Returns:
-        Tuple of (train_loader, val_loader)
-    """
-    # Load tokenizer
+def get_wmt_dataloader(data_dir, tokenizer_name='bert-base-multilingual-cased',
+                       batch_size=32, max_source_len=128, max_target_len=128,
+                       num_workers=4, max_samples=None):
+    """Load WMT14 train/validation parallel corpora without re-splitting."""
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    
-    # Load data
-    sources, targets = load_wmt_data(data_dir, max_samples)
-    
-    # Split data
-    split_idx = int(len(sources) * train_split)
-    train_sources, val_sources = sources[:split_idx], sources[split_idx:]
-    train_targets, val_targets = targets[:split_idx], targets[split_idx:]
-    
-    # Create datasets
-    train_dataset = Seq2SeqDataset(
-        train_sources, train_targets, tokenizer,
-        max_source_len, max_target_len
-    )
-    val_dataset = Seq2SeqDataset(
-        val_sources, val_targets, tokenizer,
-        max_source_len, max_target_len
-    )
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collate_seq2seq,
-        pin_memory=torch.cuda.is_available()
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_seq2seq,
-        pin_memory=torch.cuda.is_available()
-    )
-    
-    return train_loader, val_loader, tokenizer
+    loaders = []
+    for split in ('train', 'validation'):
+        sources, targets = load_wmt_data(data_dir, max_samples, split)
+        dataset = Seq2SeqDataset(sources, targets, tokenizer, max_source_len, max_target_len)
+        loaders.append(DataLoader(dataset, batch_size=batch_size, shuffle=split == 'train',
+                                  num_workers=num_workers, collate_fn=collate_seq2seq,
+                                  pin_memory=torch.cuda.is_available()))
+    return *loaders, tokenizer
 
 
 # =============================================================================
@@ -473,7 +400,7 @@ def load_commongen_data(
     
     for _, row in df.iterrows():
         concepts = row['concepts']
-        if isinstance(concepts, list):
+        if isinstance(concepts, (list, tuple)) or hasattr(concepts, 'tolist'):
             concepts_str = ', '.join(concepts)
         else:
             concepts_str = str(concepts)
@@ -573,7 +500,7 @@ def get_nlp_dataloader(
         default_tokenizer = 'facebook/bart-base'
     
     default_tokenizers = {
-        'wmt': default_tokenizer,  # Use BART for all tasks for consistency
+        'wmt': 'bert-base-multilingual-cased',
         'cnn_dailymail': default_tokenizer,
         'commongen': default_tokenizer,
     }

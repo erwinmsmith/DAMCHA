@@ -32,12 +32,13 @@ class NLPMetricsLogger:
         'learning_rate', 'timestamp',
     ]
 
-    def __init__(self, save_dir: str, experiment_name: str):
+    def __init__(self, save_dir: str, experiment_name: str, resume: bool = False):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = self.save_dir / f"metrics_{experiment_name}.csv"
-        with open(self.csv_path, 'w', newline='') as f:
-            csv.DictWriter(f, fieldnames=self.HEADERS).writeheader()
+        if not (resume and self.csv_path.exists()):
+            with open(self.csv_path, 'w', newline='') as f:
+                csv.DictWriter(f, fieldnames=self.HEADERS).writeheader()
         print(f"NLP metrics will be saved to: {self.csv_path}")
 
     def log_epoch(self, metrics: dict):
@@ -56,9 +57,9 @@ class NLPMetricsLogger:
 
 def _stats(values: List[float], min_valid: float = 0.0) -> Tuple[float, float, float]:
     """Return (mean, Q25, Q75) from a list, filtering out values below min_valid."""
-    valid = [v for v in values if v >= min_valid]
+    valid = [v for v in values if np.isfinite(v) and v >= min_valid]
     if not valid:
-        return -1.0, -1.0, -1.0
+        return float('nan'), float('nan'), float('nan')
     arr = np.array(valid, dtype=np.float64)
     return float(arr.mean()), float(np.percentile(arr, 25)), float(np.percentile(arr, 75))
 
@@ -84,8 +85,7 @@ def _get_bart_scorer(device: str, model_name: str = 'facebook/bart-base'):
             _BART_CACHE[key] = (mdl, tok)
             print("BARTScore model loaded.")
         except Exception as e:
-            print(f"Warning: could not load BARTScore model: {e}")
-            _BART_CACHE[key] = None
+            raise RuntimeError(f'Could not load BARTScore model {model_name}') from e
     return _BART_CACHE[key]
 
 
@@ -102,11 +102,11 @@ def compute_per_sample_bartscore(
     Compute per-sample BARTScore = mean log P(reference_token | hypothesis, ref_prefix).
 
     Higher (less negative) is better.
-    Returns -1.0 per sample on failure.
+    Model-loading and scoring failures raise an error.
     """
+    if len(hypotheses) != len(references):
+        raise ValueError('Hypotheses and references must have equal lengths')
     scorer = _get_bart_scorer(device, model_name)
-    if scorer is None:
-        return [-9999.0] * len(hypotheses)
 
     model, tokenizer = scorer
     scores: List[float] = []
@@ -147,16 +147,14 @@ def compute_per_sample_bartscore(
                 lab = labels[b]              # [T]
                 valid_mask = lab != pad_id
                 if valid_mask.sum() == 0:
-                    scores.append(-9999.0)
-                    continue
+                    raise ValueError('BARTScore reference contains no valid tokens')
                 gathered = log_probs[b, :, :][
                     torch.arange(lab.size(0), device=device), lab
                 ]                            # [T]
                 score = gathered[valid_mask].mean().item()
                 scores.append(score)
         except Exception as e:
-            print(f"  BARTScore batch error: {e}")
-            scores.extend([-9999.0] * len(batch_hyps))
+            raise RuntimeError(f'BARTScore failed for batch starting at sample {i}') from e
 
     return scores
 
@@ -219,17 +217,11 @@ def compute_all_metrics(
     else:
         metrics['top50_nll_mean'] = -1.0
 
-    # Top-50 BARTScore (select samples with highest BARTScore, excluding sentinel)
-    if k > 0 and any(v > -100.0 for v in per_sample_bartscore):
-        bs_sorted = sorted(
-            [(v, i) for i, v in enumerate(per_sample_bartscore) if v > -100.0],
-            reverse=True
-        )
-        top_bs_idx = [i for _, i in bs_sorted[:k]]
-        top_bs_vals = [per_sample_bartscore[i] for i in top_bs_idx]
-        metrics['top50_bartscore_mean'] = float(np.mean(top_bs_vals))
-    else:
-        metrics['top50_bartscore_mean'] = -1.0
+    top_indices = sorted((i for i, value in enumerate(per_sample_nll) if value >= 0),
+                         key=lambda i: per_sample_nll[i])[:top_k]
+    values = [per_sample_bartscore[i] for i in top_indices
+              if np.isfinite(per_sample_bartscore[i]) and per_sample_bartscore[i] > -100]
+    metrics['top50_bartscore_mean'] = float(np.mean(values)) if values else float('nan')
 
     return metrics
 
@@ -261,17 +253,6 @@ def compute_per_sample_nlp_metrics(
         'per_sample_rouge2': per_r2,
         'per_sample_rougeL': per_rL,
     }
-
-
-def compute_topk_nlp_metrics(
-    hypotheses: List[str],
-    references: List[str],
-    task: str,
-    top_k: int = 50,
-    device: str = 'cpu',
-) -> Tuple[Dict[str, float], Dict]:
-    """Legacy interface kept for backward compat — delegates to compute_all_metrics."""
-    return {}, {}
 
 
 def save_all_samples_nlp_metrics(

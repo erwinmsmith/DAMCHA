@@ -1,11 +1,11 @@
-"""DAMCHA: Dynamic Attention with M-matrix Cross-Head Aggregation.
+"""DAMCHA: Data-Adaptive Mahalanobis Cross-Head Attention.
 
 Usage:
 # CV Datasets: cifar10, cifar100, mnist
 python main.py --dataset cifar10 --epochs 50
 python main.py --dataset cifar10 --epochs 50 --use_M --use_mlp --share_mlp
 
-# Multi-head M mode: aggregate off-diagonal blocks to diagonal, then extract per-head M
+# Multi-head M mode: sum blocks along each block row
 python main.py --dataset cifar10 --epochs 50 --use_M --use_mlp --share_mlp --use_multihead_M
 
 # Off-diagonal modes:
@@ -30,7 +30,7 @@ from utils import seed_everything
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='DAMCHA: Dynamic Attention with M-matrix Cross-Head Aggregation'
+        description='DAMCHA: Data-Adaptive Mahalanobis Cross-Head Attention'
     )
     
     # Mode
@@ -40,8 +40,8 @@ def parse_args():
         help='Enable development mode with debug information'
     )
     parser.add_argument(
-        '--gpu', type=int, default=0, choices=[0, 1, 2],
-        help='GPU device ID (0, 1, or 2)'
+        '--gpu', type=int, default=0,
+        help='CUDA device index'
     )
     
     # Data
@@ -91,11 +91,11 @@ def parse_args():
                        help='Weight for KL divergence term in Bayesian mode (ELBO loss)')
     parser.add_argument('--diag_scale', type=float, default=1.0,
                        help='Scaling factor for diagonal blocks (default 1.0)')
-    parser.add_argument('--off_diag_scale', type=float, default=0.5,
+    parser.add_argument('--off_diag_scale', type=float, default=1.0,
                        help='Scaling factor for off-diagonal blocks (controls off-diagonal strength)')
     parser.add_argument('--off_diag_alpha_init', type=float, default=0.1,
                        help='Initial std for off-diagonal alpha weights (linear combination coefficients)')
-    parser.add_argument('--use_layer_bias', action='store_true', default=True,
+    parser.add_argument('--use_layer_bias', action='store_true', default=False,
                        help='Use learnable per-layer bias for M matrix (enables different M per layer with shared MLP)')
     parser.add_argument('--no_layer_bias', action='store_true',
                        help='Disable per-layer bias for M matrix')
@@ -104,8 +104,7 @@ def parse_args():
     
     # Multi-head M mode: aggregate off-diagonal to diagonal, then extract per-head M
     parser.add_argument('--use_multihead_M', action='store_true',
-                       help='Use multi-head M attention: aggregate off-diagonal blocks to diagonal, '
-                            'then extract per-head M matrices')
+                       help='Compatibility flag; DAMCHA always uses per-head RowSum metrics')
     
     # MLP hidden dimensions
     parser.add_argument('--mlp_hidden_1', type=int, default=256,
@@ -153,7 +152,7 @@ def parse_args():
                        help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=3e-4,
                        help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.01,
+    parser.add_argument('--weight_decay', type=float, default=0.0,
                        help='Weight decay')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
@@ -175,7 +174,20 @@ def parse_args():
                        choices=['cuda', 'cpu'],
                        help='Device to use for training')
     
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.d_model <= 0 or args.n_heads <= 0 or args.d_model % args.n_heads:
+        parser.error('d_model must be positive and divisible by n_heads')
+    if args.n_layers < 1 or args.epochs < 1 or args.batch_size < 1 or args.save_every < 1:
+        parser.error('layers, epochs, batch_size and save_every must be positive')
+    if args.dataset == 'mnist':
+        args.in_ch = 1
+    if args.use_mlp and not args.use_M:
+        parser.error('--use_mlp requires --use_M')
+    if args.share_mlp and not args.use_mlp:
+        parser.error('--share_mlp requires --use_mlp')
+    if args.baseline and args.use_M:
+        parser.error('--baseline and --use_M select different attention mechanisms')
+    return args
 
 
 def print_config(config: dict):
@@ -211,7 +223,7 @@ def print_config(config: dict):
         mlp_mode = "SHARED" if config['share_mlp'] else "SEPARATE"
         print(f"  Mode: DAMCHA with MLP ({mlp_mode})")
     else:
-        print(f"  Mode: M0-only")
+        print(f"  Mode: Static-metric")
     print(f"  use_M: {config['use_M']}")
     print(f"  use_mlp: {config['use_mlp']}")
     print(f"  share_mlp: {config['share_mlp']}")
@@ -300,11 +312,11 @@ def main():
         'diag_scale': args.diag_scale,
         'off_diag_scale': args.off_diag_scale,
         'off_diag_alpha_init': args.off_diag_alpha_init,
-        'use_layer_bias': (not args.no_layer_bias) if (args.use_M and args.use_mlp and args.share_mlp) else False,
+        'use_layer_bias': (args.use_layer_bias and not args.no_layer_bias) if (args.use_M and args.use_mlp and args.share_mlp) else False,
         'layer_bias_rank': args.layer_bias_rank,
         
         # Multi-head M mode
-        'use_multihead_M': args.use_multihead_M if args.use_M else False,
+        'use_multihead_M': args.use_M,
 
         # Compact M rank (0 = full D×D, >0 = low-rank U@V^T)
         'compact_rank': args.compact_M_rank if (args.use_M and args.use_mlp) else 0,

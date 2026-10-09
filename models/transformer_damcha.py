@@ -1,12 +1,12 @@
 """
-DAMCHA Transformer: Decoder-Only Transformer with Dynamic Attention M-matrix Cross-Head Aggregation.
+DAMCHA Transformer: Data-Adaptive Mahalanobis Cross-Head Attention.
 
 Key features:
 - Decoder-only architecture for self-supervised masked reconstruction
 - M-based attention: softmax(X @ M @ X.T / sqrt(d_head)) @ V
 - M0 prior: Block matrix based on M^(h) = W_q^(h) @ W_k^(h).T structure
 - MLP-based M generation with structural constraints
-- Multi-head M: aggregate off-diagonal blocks to diagonal, then extract per-head M
+- Per-head metrics: sum cross-head blocks along each block row
 """
 
 import math
@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .m_attention import StructuredMLPForM
+from .m_attention import StructuredMLPForM, MBasedAttention
 
 
 class FeedForward(nn.Module):
@@ -46,302 +46,30 @@ class PositionalEncoding(nn.Module):
             torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[:pe[:, 1::2].shape[1]])
         self.register_buffer('pe', pe)
     
     def forward(self, x):
         return x + self.pe[: x.size(1)].unsqueeze(0)
 
 
-class DAMCHAAttention(nn.Module):
-    """
-    DAMCHA: Dynamic Attention with M-matrix Cross-Head Aggregation.
-    
-    Attention mechanism: softmax(X @ M @ X.T / sqrt(d_head)) @ V
-    
-    M0 Prior Structure (FIXED, not updated):
-    - M is a block matrix where M^(h) = W_q^(h) @ W_k^(h).T
-    - Diagonal blocks: M^(h) for each head h
-    - Off-diagonal blocks: M^(i,j) for cross-head interaction
-    
-    Modes:
-    - use_M=False: Standard Q/K/V attention (default)
-    - use_M=True, use_mlp=False: Use M0 matrix directly
-    - use_M=True, use_mlp=True: MLP-based M generation
-    
-    Multi-head M mode (use_multihead_M=True):
-    - Aggregate off-diagonal blocks to diagonal blocks
-    - Extract per-head M matrices from aggregated diagonal blocks
-    """
-    
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        dropout: float = 0.1,
-        mlp_hidden: Tuple[int, ...] = (256, 512),
-        dev_mode: bool = False,
-        use_M: bool = False,
-        use_mlp: bool = False,
-        layer_idx: int = 0,
-        use_multihead_M: bool = False,
-        **kwargs,
-    ):
-        super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
-        self.dim_M = d_model * d_model
-        self.dev_mode = dev_mode
-        self.use_M = use_M
-        self.use_mlp = use_mlp if use_M else False
-        self.layer_idx = layer_idx
-        self.use_multihead_M = use_multihead_M if use_M else False
-        
-        # Value projection and output projection
-        self.W_v = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-        
-        # Standard attention projections (used when use_M=False)
-        if not use_M:
-            self.W_q = nn.Linear(d_model, d_model)
-            self.W_k = nn.Linear(d_model, d_model)
-        
-        # Initialize M0 prior
-        self._init_M0_prior()
-        
-        # MLP for M generation
-        self._mlp_config = {
-            'hidden_dims': mlp_hidden,
-            'dropout': dropout,
-        }
-        self._own_mlp = None
-        self._shared_mlp = None
-        
-        # Cache for M
-        self.register_buffer('cached_M', torch.zeros(self.dim_M), persistent=False)
-    
-    def _create_own_mlp(self):
-        """Lazily create own MLP if not using shared."""
-        if self._own_mlp is None:
-            self._own_mlp = StructuredMLPForM(
-                d_model=self.d_model,
-                n_heads=self.n_heads,
-                hidden_dims=self._mlp_config['hidden_dims'],
-                dropout=self._mlp_config['dropout'],
-            )
-        return self._own_mlp
-    
-    @property
-    def mlp_m(self) -> StructuredMLPForM:
-        """Get the active MLP for M generation (shared or own)."""
-        if self._shared_mlp is not None:
-            return self._shared_mlp
-        return self._create_own_mlp()
-    
-    def set_shared_mlp(self, shared_mlp: StructuredMLPForM):
-        """Set a shared MLP to be used instead of the own MLP."""
-        self._shared_mlp = shared_mlp
-        self._own_mlp = None
-    
-    def use_own_mlp(self):
-        """Revert to using own MLP instead of shared."""
-        self._shared_mlp = None
-    
-    def get_M_from_mlp(self, layer_idx: int = 0) -> torch.Tensor:
-        """Get M matrix from MLP."""
-        return self.mlp_m.get_M_single(layer_idx=layer_idx)
-    
-    @torch.no_grad()
-    def _init_M0_prior(self):
-        """
-        Initialize M0 prior based on standard attention structure.
-        M^(h) = W_q^(h) @ W_k^(h).T for each head h
-        """
-        d, h, d_h = self.d_model, self.n_heads, self.d_head
-        
-        M0 = torch.zeros(d, d)
-        
-        # Initialize diagonal blocks
-        for head in range(h):
-            W_q = torch.empty(d_h, d_h)
-            W_k = torch.empty(d_h, d_h)
-            nn.init.orthogonal_(W_q)
-            nn.init.orthogonal_(W_k)
-            
-            M_h = W_q @ W_k.t()
-            start = head * d_h
-            end = (head + 1) * d_h
-            M0[start:end, start:end] = M_h
-        
-        # Initialize off-diagonal blocks
-        for i in range(h):
-            for j in range(h):
-                if i != j:
-                    start_i, end_i = i * d_h, (i + 1) * d_h
-                    start_j, end_j = j * d_h, (j + 1) * d_h
-                    M0[start_i:end_i, start_j:end_j] = 0.01 * torch.randn(d_h, d_h)
-        
-        self.register_buffer('M0', M0)
-        
-        if self.dev_mode:
-            print(f"[DAMCHA] M0 initialized: shape={M0.shape}, norm={M0.norm():.4f}")
-    
-    def get_M(self) -> torch.Tensor:
-        """Get cached M matrix."""
-        return self.cached_M.view(self.d_model, self.d_model)
-    
-    def get_M0(self) -> torch.Tensor:
-        """Get M0 prior matrix."""
-        return self.M0
-    
-    def _aggregate_to_multihead(self, M: torch.Tensor) -> torch.Tensor:
-        """
-        Aggregate off-diagonal blocks to diagonal blocks, then extract per-head M.
-        
-        For each head h:
-        M_h = (M_diag[h] + sum_{j!=h}(M[h,j] + M[j,h])) / (2*n_heads - 1)
-        
-        Args:
-            M: Full M matrix [d_model, d_model]
-            
-        Returns:
-            M_blocks: Per-head M matrices [n_heads, d_head, d_head]
-        """
-        M_blocks = []
-        for h in range(self.n_heads):
-            start_h, end_h = h * self.d_head, (h + 1) * self.d_head
-            M_h = M[start_h:end_h, start_h:end_h].clone()
-            
-            # Add contributions from off-diagonal blocks
-            for j in range(self.n_heads):
-                if j != h:
-                    start_j, end_j = j * self.d_head, (j + 1) * self.d_head
-                    M_h = M_h + M[start_h:end_h, start_j:end_j]
-                    M_h = M_h + M[start_j:end_j, start_h:end_h]
-            
-            # Normalize
-            M_h = M_h / (2 * self.n_heads - 1)
-            M_blocks.append(M_h)
-        
-        return torch.stack(M_blocks, dim=0)
-    
-    def _standard_attention(
-        self,
-        x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Standard Q/K/V attention."""
-        B, T, d = x.shape
-        
-        Q = self.W_q(x)
-        K = self.W_k(x)
-        V = self.W_v(x)
-        
-        Q = Q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        K = K.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        V = V.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        
-        logits = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
-        
-        if attn_mask is not None:
-            logits = logits + attn_mask.unsqueeze(0).unsqueeze(0)
-        
-        attn = F.softmax(logits, dim=-1)
-        attn = self.dropout(attn)
-        
-        out = torch.matmul(attn, V)
-        out = out.transpose(1, 2).contiguous().view(B, T, d)
-        
-        return self.out_proj(out)
-    
-    def _m_based_attention(
-        self,
-        x: torch.Tensor,
-        M: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """M-based attention: softmax(X @ M @ X.T / sqrt(d_head)) @ V"""
-        B, T, d = x.shape
-        
-        V = self.W_v(x)
-        V = V.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        
-        # Expand M for batch if needed
-        if M.dim() == 2:
-            M_expanded = M.unsqueeze(0).expand(B, -1, -1)
-        else:
-            M_expanded = M
-        
-        if self.use_multihead_M:
-            # Aggregate off-diagonal to diagonal, then extract per-head M
-            M_blocks = self._aggregate_to_multihead(M)  # [nh, d_h, d_h]
-            
-            # Reshape x into heads
-            x_heads = x.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-            
-            # Per-head attention
-            xM_heads = torch.einsum('bhtd,hde->bhte', x_heads, M_blocks)
-            logits = torch.einsum('bhte,bhse->bhts', xM_heads, x_heads)
-            logits = logits / math.sqrt(self.d_head)
-            
-            if self.dev_mode:
-                print(f"[DAMCHA MultiHead] M_blocks: {M_blocks.shape}, logits: {logits.shape}")
-        else:
-            # Single M broadcast to all heads
-            XM = torch.bmm(x, M_expanded)
-            logits = torch.bmm(XM, x.transpose(1, 2)) / math.sqrt(self.d_head)
-            logits = logits.unsqueeze(1).expand(-1, self.n_heads, -1, -1)
-        
-        if attn_mask is not None:
-            logits = logits + attn_mask.unsqueeze(0).unsqueeze(0)
-        
-        attn = F.softmax(logits, dim=-1)
-        attn = self.dropout(attn)
-        
-        out = torch.matmul(attn, V)
-        out = out.transpose(1, 2).contiguous().view(B, T, d)
-        
-        return self.out_proj(out)
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            x: Input [B, T, d_model]
-            attn_mask: Attention mask [T, T]
-            
-        Returns:
-            Output [B, T, d_model]
-        """
-        if self.dev_mode:
-            mode = "standard" if not self.use_M else ("MLP" if self.use_mlp else "M0-only")
-            print(f"\n[DAMCHA] Forward - Mode: {mode}, Training: {self.training}, Input: {x.shape}")
-        
-        # Standard Q/K/V attention
-        if not self.use_M:
-            return self._standard_attention(x, attn_mask)
-        
-        # M0-only mode
-        if not self.use_mlp:
-            with torch.no_grad():
-                self.cached_M = self.M0.flatten()
-            return self._m_based_attention(x, self.M0, attn_mask)
-        
-        # MLP-based M generation
-        M = self.get_M_from_mlp(layer_idx=self.layer_idx)
-        with torch.no_grad():
-            self.cached_M = M.flatten()
-        
-        return self._m_based_attention(x, M, attn_mask)
+class DAMCHAAttention(MBasedAttention):
+    """Tensor-output adapter for the decoder stack."""
+
+    def __init__(self, d_model, n_heads, dropout=0.1, mlp_hidden=(256, 512),
+                 dev_mode=False, use_M=False, use_mlp=False, layer_idx=0,
+                 use_multihead_M=True, **kwargs):
+        allowed = {'off_diag_mode', 'diag_scale', 'off_diag_scale',
+                   'off_diag_alpha_init', 'use_layer_bias', 'layer_bias_rank',
+                   'compact_rank', 'free_M', 'n_layers', 'shared_mlp'}
+        options = {k: v for k, v in kwargs.items() if k in allowed}
+        super().__init__(d_model, n_heads, dropout, use_M=use_M, use_mlp=use_mlp,
+                         mlp_hidden_dims=mlp_hidden, layer_idx=layer_idx,
+                         dev_mode=dev_mode, **options)
+
+    def forward(self, x, attn_mask=None, head_metrics=None, padding_mask=None):
+        return super().forward(x, attn_mask, is_causal=True,
+                               padding_mask=padding_mask, head_metrics=head_metrics)[0]
 
 
 class DecoderLayer(nn.Module):
@@ -383,7 +111,7 @@ class DecoderLayer(nn.Module):
         m = torch.triu(m, diagonal=1)
         return m
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, head_metrics=None, padding_mask=None) -> torch.Tensor:
         B, T, _ = x.shape
         device = x.device
         
@@ -391,7 +119,7 @@ class DecoderLayer(nn.Module):
             print(f"\n[DecoderLayer] Input shape: {x.shape}")
         
         attn_mask = self._causal_mask(T, device)
-        sa = self.self_attn(x, attn_mask=attn_mask)
+        sa = self.self_attn(x, head_metrics=head_metrics, padding_mask=padding_mask)
         x = self.ln1(x + self.dropout(sa))
         
         ff_out = self.ff(x)
@@ -435,26 +163,16 @@ class Decoder(nn.Module):
         self.dev_mode = dev_mode
         self.use_M = use_M
         self.use_mlp = use_mlp
-        self.share_mlp = share_mlp and use_mlp
+        self.share_mlp = share_mlp and use_mlp and use_M
         self.use_multihead_M = use_multihead_M if use_M else False
         
         self.off_diag_mode = kwargs.get('off_diag_mode', 'mlp')
-        self.use_layer_bias = kwargs.get('use_layer_bias', True)
-        
-        self.layers = nn.ModuleList([
-            DecoderLayer(
-                d_model, n_heads, d_ff, dropout, dev_mode=dev_mode,
-                use_M=use_M, use_mlp=use_mlp,
-                layer_idx=i, use_multihead_M=use_multihead_M, **kwargs
-            )
-            for i in range(n_layers)
-        ])
-        self.pe = PositionalEncoding(d_model)
+        self.use_layer_bias = kwargs.get('use_layer_bias', False)
         
         # Create shared MLP if enabled
         if self.share_mlp:
             mlp_hidden = kwargs.get('mlp_hidden', (256, 512))
-            off_diag_scale = kwargs.get('off_diag_scale', 0.5)
+            off_diag_scale = kwargs.get('off_diag_scale', 1.0)
             off_diag_alpha_init = kwargs.get('off_diag_alpha_init', 0.1)
             layer_bias_rank = kwargs.get('layer_bias_rank', 16)
             
@@ -463,6 +181,7 @@ class Decoder(nn.Module):
                 n_heads=n_heads,
                 hidden_dims=mlp_hidden,
                 dropout=dropout,
+                diag_scale=kwargs.get("diag_scale", 1.0),
                 off_diag_mode=self.off_diag_mode,
                 off_diag_scale=off_diag_scale,
                 off_diag_alpha_init=off_diag_alpha_init,
@@ -473,21 +192,35 @@ class Decoder(nn.Module):
                 free_M=kwargs.get('free_M', False),
             )
             
-            for layer in self.layers:
-                layer.get_attn().set_shared_mlp(self.shared_mlp_module)
             
             if dev_mode:
                 print(f"[Decoder] Using SHARED MLP across {n_layers} blocks")
                 print(f"  MLP params: {sum(p.numel() for p in self.shared_mlp_module.parameters()):,}")
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        self.layers = nn.ModuleList([
+            DecoderLayer(
+                d_model, n_heads, d_ff, dropout, dev_mode=dev_mode,
+                use_M=use_M, use_mlp=use_mlp,
+                layer_idx=i, use_multihead_M=use_multihead_M, n_layers=n_layers, shared_mlp=getattr(self, "shared_mlp_module", None), **kwargs
+            )
+            for i in range(n_layers)
+        ])
+        self.pe = PositionalEncoding(d_model)
+
+
+    def forward(self, x: torch.Tensor, padding_mask=None) -> torch.Tensor:
         x = self.pe(x)
+        metrics = None
+        if self.share_mlp and not self.use_layer_bias:
+            metrics = self.shared_mlp_module.head_metrics(x, causal=True, padding_mask=padding_mask)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, head_metrics=metrics, padding_mask=padding_mask)
         return x
     
     def get_M_matrices(self):
         """Get all M matrices from layers."""
+        if not self.use_M:
+            return []
         matrices = []
         for i, layer in enumerate(self.layers):
             M = layer.get_M()
@@ -512,7 +245,9 @@ class Decoder(nn.Module):
         """Get KL divergence for Bayesian mode."""
         if self.share_mlp and hasattr(self, 'shared_mlp_module'):
             return self.shared_mlp_module.get_kl_divergence()
-        return torch.tensor(0.0)
+        terms = [layer.get_attn().mlp_m.get_kl_divergence() for layer in self.layers
+                 if layer.get_attn().use_mlp]
+        return sum(terms, self.pe.pe.new_zeros(()))
 
 
 class TransformerPC(nn.Module):
@@ -552,12 +287,12 @@ class TransformerPC(nn.Module):
         self.share_mlp = share_mlp
         self.use_multihead_M = use_multihead_M
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, padding_mask=None) -> torch.Tensor:
         if self.dev_mode:
             mode = "standard" if not self.use_M else ("MLP" if self.use_mlp else "M0-only")
             print(f"\n[TransformerPC] Forward - Mode: {mode}, Training: {self.training}, Input: {x.shape}")
         
-        return self.decoder(x)
+        return self.decoder(x, padding_mask=padding_mask)
     
     def get_M_matrices(self):
         """Get all M matrices from decoder layers."""

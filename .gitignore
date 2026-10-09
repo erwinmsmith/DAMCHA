@@ -1,36 +1,19 @@
-# ── Large data / model files ──────────────────────────────────────────
+# Runtime data and experiment artifacts
 data/rawdata/
-!data/rawdata/.gitkeep
-
-# ── Checkpoints ───────────────────────────────────────────────────────
-checkpoints/**/*.pt
-checkpoints/**/*.pth
-checkpoints/**/*.bin
-checkpoints/**/*.ckpt
-!checkpoints/**/.gitkeep
-
-# ── Logs (keep folder structure, not content) ─────────────────────────
-logs/**/*.log
-logs/**/*.csv
-logs/**/*.json
-!logs/**/.gitkeep
-
-# ── Outputs (metrics / visualizations / generated files) ──────────────
-outputs/**/*.csv
-outputs/**/*.json
-outputs/**/*.png
-outputs/**/*.jpg
-outputs/**/*.npz
-outputs/**/*.npy
-!outputs/**/.gitkeep
-
-# ── Python cache ──────────────────────────────────────────────────────
-__pycache__/
-*.pyc
-*.pyo
-.ipynb_checkpoints/
-
-# ── Misc ──────────────────────────────────────────────────────────────
+checkpoints/
+logs/
+outputs/
+# Build products and local environments
+site/
+build/
+dist/
+.venv/
+venv/
 *.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.ipynb_checkpoints/
 .DS_Store
 nohup.out

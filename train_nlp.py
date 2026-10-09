@@ -8,7 +8,7 @@ Supports:
 
 Training modes:
 - Standard Transformer (default)
-- M0-only attention (--use_M)
+- Static-metric attention (--use_M)
 - MLP-based M generation (--use_M --use_mlp)
 """
 
@@ -22,10 +22,10 @@ from typing import Tuple, Optional, Dict, List
 
 from models.transformer_damcha import TransformerPC
 from models.baselines import BaselineTransformer, BASELINE_NAMES
-from utils import AverageMeter, Timer, count_parameters, get_lr, save_checkpoint
+from utils import AverageMeter, Timer, count_parameters, get_lr, save_checkpoint, load_checkpoint
 from visualization import MetricsLogger, Visualizer
 from evaluation_nlp import (
-    compute_all_metrics, compute_topk_nlp_metrics, NLPMetricsLogger,
+    compute_all_metrics, NLPMetricsLogger,
     compute_per_sample_nlp_metrics, save_all_samples_nlp_metrics,
     compute_per_sample_bartscore,
 )
@@ -59,6 +59,7 @@ class NLPTrainer:
         top_k_samples: int = 50,
         compute_topk_metrics: bool = False,
         metrics_save_dir: str = './outputs/metrics',
+        kl_weight: float = 1e-4,
     ):
         self.model = model
         self.head = head
@@ -69,6 +70,9 @@ class NLPTrainer:
         self.top_k_samples = top_k_samples
         self.compute_topk_metrics_flag = compute_topk_metrics
         self.metrics_save_dir = metrics_save_dir
+        self.kl_weight = kl_weight
+        self.embedding = nn.Embedding(len(tokenizer), model.d_model,
+                                     padding_idx=tokenizer.pad_token_id).to(device)
         
         # Move to device
         self.model.to(device)
@@ -76,7 +80,7 @@ class NLPTrainer:
         
         # Loss function (ignore padding token)
         self.criterion = nn.CrossEntropyLoss(
-            ignore_index=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100
+            ignore_index=-100
         )
     
     def _compute_loss(
@@ -99,7 +103,7 @@ class NLPTrainer:
         # Shift for autoregressive prediction
         # logits: predict next token, target: actual next token
         shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = target_ids[:, 1:].contiguous()
+        shift_labels = target_ids[:, 1:].masked_fill(~target_mask[:, 1:].bool(), -100).contiguous()
         
         # Flatten for loss computation
         loss = self.criterion(
@@ -143,30 +147,16 @@ class NLPTrainer:
             
             optimizer.zero_grad()
             
-            # For decoder-only model, concatenate source and target
-            # Input: [source_ids, target_ids[:-1]]
-            # Target: [source_ids (ignored), target_ids[1:]]
-            input_ids = target_ids  # Use target for autoregressive training
-            
-            # Create embeddings (simple embedding layer)
-            # Note: In full implementation, would use proper embedding
-            # Here we use the model directly with token IDs converted to embeddings
-            
-            # Forward pass through decoder
-            # The model expects [B, T, d_model] input
-            # We need an embedding layer
-            dec_out = self.model(self._embed_tokens(input_ids))
-            
-            # Get logits
-            logits = self.head(dec_out)
-            
+            logits = self._conditioned_logits(source_ids, target_ids, source_mask, target_mask)
+
             # Compute loss
             loss = self._compute_loss(logits, target_ids, target_mask)
             
+            loss = loss + self.kl_weight * self.model.get_kl_divergence()
             # Backward and optimize
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                list(self.model.parameters()) + list(self.head.parameters()),
+                list(self.model.parameters()) + list(self.head.parameters()) + list(self.embedding.parameters()),
                 max_norm=1.0
             )
             optimizer.step()
@@ -186,74 +176,60 @@ class NLPTrainer:
         epoch_time = timer.stop()
         return loss_meter.avg, epoch_time
     
-    def _embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Convert token IDs to embeddings.
-        Uses a simple learned embedding.
-        """
-        if not hasattr(self, 'embedding'):
-            vocab_size = self.tokenizer.vocab_size
-            d_model = self.model.d_model
-            self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=self.tokenizer.pad_token_id)
-            self.embedding.to(self.device)
-        
+    def _embed_tokens(self, token_ids):
         return self.embedding(token_ids)
-    
+
+    def _conditioned_logits(self, source_ids, target_ids, source_mask=None, target_mask=None):
+        """Pack source + target; return logits aligned to target positions."""
+        pad = self.tokenizer.pad_token_id
+        if source_mask is None:
+            source_mask = source_ids.ne(pad) if pad is not None else torch.ones_like(source_ids)
+        if target_mask is None:
+            target_mask = torch.ones_like(target_ids)
+        sources = [row[mask.bool()] for row, mask in zip(source_ids, source_mask)]
+        sequences = [torch.cat((src, tgt)) for src, tgt in zip(sources, target_ids)]
+        inputs = nn.utils.rnn.pad_sequence(sequences, batch_first=True, padding_value=pad or 0)
+        valid = torch.zeros_like(inputs, dtype=torch.bool)
+        positions = []
+        for i, src in enumerate(sources):
+            valid[i, :len(src)] = True
+            valid[i, len(src):len(src) + target_ids.size(1)] = target_mask[i].bool()
+            positions.append(torch.arange(target_ids.size(1), device=inputs.device) + len(src))
+        hidden = self.model(self.embedding(inputs), padding_mask=valid)
+        positions = torch.stack(positions)
+        target_hidden = hidden.gather(1, positions[..., None].expand(-1, -1, hidden.size(-1)))
+        return self.head(target_hidden)
+
     @torch.no_grad()
-    def generate(
-        self,
-        source_ids: torch.Tensor,
-        max_length: int = 128,
-        temperature: float = 1.0,
-    ) -> torch.Tensor:
-        """
-        Generate text autoregressively.
-        
-        Args:
-            source_ids: Source token IDs [B, T_src]
-            max_length: Maximum generation length
-            temperature: Sampling temperature
-            
-        Returns:
-            Generated token IDs [B, T_gen]
-        """
+    def generate(self, source_ids, max_length=128, temperature=1.0):
+        """Greedy source-conditioned generation with per-example EOS stopping."""
+        if temperature <= 0 or max_length < 1:
+            raise ValueError('temperature and max_length must be positive')
         self.model.eval()
         self.head.eval()
-        
-        B = source_ids.size(0)
-        device = source_ids.device
-        
-        # Start with BOS token
-        if self.tokenizer.bos_token_id is not None:
-            generated = torch.full((B, 1), self.tokenizer.bos_token_id, device=device)
-        else:
-            generated = torch.full((B, 1), self.tokenizer.pad_token_id, device=device)
-        
+        start = self.tokenizer.bos_token_id
+        if start is None:
+            start = getattr(self.tokenizer, 'cls_token_id', None)
+        if start is None:
+            raise ValueError('Tokenizer must define a BOS or CLS token')
+        generated = source_ids.new_full((source_ids.size(0), 1), start)
+        finished = torch.zeros(source_ids.size(0), device=source_ids.device, dtype=torch.bool)
+        eos = self.tokenizer.eos_token_id
+        if eos is None:
+            eos = getattr(self.tokenizer, 'sep_token_id', None)
+        pad = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else eos
         for _ in range(max_length - 1):
-            # Get embeddings
-            embeddings = self._embed_tokens(generated)
-            
-            # Forward pass
-            dec_out = self.model(embeddings)
-            
-            # Get logits for last position
-            logits = self.head(dec_out[:, -1:, :])  # [B, 1, vocab_size]
-            logits = logits / temperature
-            
-            # Sample next token
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.argmax(probs, dim=-1)  # Greedy decoding
-            
-            # Append to generated
-            generated = torch.cat([generated, next_token], dim=1)
-            
-            # Check for EOS
-            if self.tokenizer.eos_token_id is not None:
-                if (next_token == self.tokenizer.eos_token_id).all():
+            logits = self._conditioned_logits(source_ids, generated)[:, -1]
+            token = (logits / temperature).argmax(-1)
+            if pad is not None:
+                token = token.masked_fill(finished, pad)
+            generated = torch.cat((generated, token[:, None]), dim=1)
+            if eos is not None:
+                finished |= token.eq(eos)
+                if finished.all():
                     break
-        
         return generated
-    
+
     @torch.no_grad()
     def evaluate(
         self,
@@ -281,8 +257,6 @@ class NLPTrainer:
         all_per_sample_nll = []  # Per-sample NLL (negative log-likelihood)
         all_per_sample_ppl = []  # Per-sample perplexity
         
-        # Limit validation batches for speed
-        MAX_EVAL_BATCHES = 50
         
         for batch_idx, batch in enumerate(loader):
             
@@ -295,10 +269,8 @@ class NLPTrainer:
             B = source_ids.size(0)
             
             # Compute loss
-            input_ids = target_ids
-            embeddings = self._embed_tokens(input_ids)
-            dec_out = self.model(embeddings)
-            logits = self.head(dec_out)
+            logits = self._conditioned_logits(source_ids, target_ids,
+                                               batch['source_mask'].to(self.device), target_mask)
             loss = self._compute_loss(logits, target_ids, target_mask)
             
             loss_meter.update(loss.item(), B)
@@ -316,7 +288,7 @@ class NLPTrainer:
                     
                     # Mask out padding tokens
                     pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else -100
-                    valid_mask = sample_labels != pad_id
+                    valid_mask = target_mask[i, 1:].bool()
                     
                     if valid_mask.sum() > 0:
                         valid_logits = sample_logits[valid_mask]
@@ -341,8 +313,6 @@ class NLPTrainer:
                     all_hypotheses.append(gen_text)
                     all_references.append(target_texts[i])
             
-            if batch_idx >= MAX_EVAL_BATCHES - 1:
-                break
         
         val_loss = loss_meter.avg
         metrics = {'val_loss': val_loss}
@@ -394,7 +364,7 @@ def build_nlp_model(
     device: str,
     off_diag_mode: str = 'mlp',
     diag_scale: float = 1.0,
-    off_diag_scale: float = 0.5,
+    off_diag_scale: float = 1.0,
     off_diag_alpha_init: float = 0.1,
     use_layer_bias: bool = False,
     layer_bias_rank: int = 16,
@@ -461,69 +431,22 @@ def modify_model_scales(model, diag_scale, off_diag_scale):
     return modified
 
 
-def run_block_ablation_evaluation_nlp(
-    model: TransformerPC,
-    trainer: 'NLPTrainer',
-    val_loader: DataLoader,
-    config: dict,
-    metrics_dir: str,
-):
-    """
-    Run block ablation evaluation for NLP tasks with diagonal-only and off-diagonal-only M matrix.
-    
-    Args:
-        model: Trained TransformerPC model
-        trainer: NLPTrainer instance
-        val_loader: Validation data loader
-        config: Training configuration
-        metrics_dir: Directory to save metrics
-    """
+def run_block_ablation_evaluation_nlp(model, trainer, val_loader, config, metrics_dir):
+    """Evaluate diagonal and off-diagonal metrics using the same validation interface."""
     import json
-    
-    # Store original scales
-    original_diag_scale = config.get('diag_scale', 1.0)
-    original_off_diag_scale = config.get('off_diag_scale', 0.5)
-    
+    original = (config.get('diag_scale', 1.0), config.get('off_diag_scale', 1.0))
     results = {}
-    
-    # Evaluate with diagonal-only (diag_scale=1.0, off_diag_scale=0.0)
-    print("\n[Diagonal-only] Evaluating with diag_scale=1.0, off_diag_scale=0.0...")
-    modify_model_scales(model, diag_scale=1.0, off_diag_scale=0.0)
-    
-    diag_loss, diag_metrics = trainer.evaluate(val_loader, epoch=-1, compute_metrics=True)
-    
-    results['diagonal_only'] = {
-        'val_loss': float(diag_loss),
-        'bartscore': float(diag_metrics.get('bartscore', -1.0)),
-        'top50_bartscore': float(diag_metrics.get('top50_bartscore', -1.0)),
-        'bleu': float(diag_metrics.get('bleu', -1.0)),
-    }
-    print(f"  bartscore: {diag_metrics.get('bartscore', -1.0):.4f}, top50_bartscore: {diag_metrics.get('top50_bartscore', -1.0):.4f}")
-    
-    # Evaluate with off-diagonal-only (diag_scale=0.0, off_diag_scale=1.0)
-    print("\n[Off-diagonal-only] Evaluating with diag_scale=0.0, off_diag_scale=1.0...")
-    modify_model_scales(model, diag_scale=0.0, off_diag_scale=1.0)
-    
-    offdiag_loss, offdiag_metrics = trainer.evaluate(val_loader, epoch=-1, compute_metrics=True)
-    
-    results['offdiag_only'] = {
-        'val_loss': float(offdiag_loss),
-        'bartscore': float(offdiag_metrics.get('bartscore', -1.0)),
-        'top50_bartscore': float(offdiag_metrics.get('top50_bartscore', -1.0)),
-        'bleu': float(offdiag_metrics.get('bleu', -1.0)),
-    }
-    print(f"  bartscore: {offdiag_metrics.get('bartscore', -1.0):.4f}, top50_bartscore: {offdiag_metrics.get('top50_bartscore', -1.0):.4f}")
-    
-    # Restore original scales
-    modify_model_scales(model, diag_scale=original_diag_scale, off_diag_scale=original_off_diag_scale)
-    
-    # Save results
-    results_file = os.path.join(metrics_dir, 'block_ablation_results.json')
-    with open(results_file, 'w') as f:
+    try:
+        for epoch, (name, diag, off) in enumerate([
+                ('diagonal_only', 1., 0.), ('offdiag_only', 0., 1.)], start=1):
+            modify_model_scales(model, diag, off)
+            loss, metrics = trainer.evaluate(val_loader, epoch=-epoch, compute_metrics=True)
+            results[name] = {**metrics, 'val_loss': float(loss)}
+    finally:
+        modify_model_scales(model, *original)
+    with open(os.path.join(metrics_dir, 'block_ablation_results.json'), 'w') as f:
         json.dump(results, f, indent=2)
-    
-    print(f"\nBlock ablation results saved to: {results_file}")
-    print("="*80)
+    return results
 
 
 def train_nlp(
@@ -576,13 +499,17 @@ def train_nlp(
         else:
             mode_name = f'mlp_separate{depth_suffix}{multihead_suffix}{compact_suffix}{free_suffix}'
     else:
-        mode_name = 'M0_only'
+        mode_name = 'static_metric'
     
     # Initialize output directories
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_mode = mode_name.replace('/', '_')
     experiment_name = f"{safe_mode}_{timestamp}"
+    if config.get('resume'):
+        previous = torch.load(config['resume'], map_location='cpu', weights_only=True)
+        experiment_name = previous.get('config', {}).get('experiment_name', experiment_name)
+    config['experiment_name'] = experiment_name
     
     output_base = config.get('output_dir', './outputs')
     vis_dir = os.path.join(output_base, dataset_name, 'visualizations', mode_name)
@@ -593,7 +520,8 @@ def train_nlp(
     
     metrics_logger = NLPMetricsLogger(
         save_dir=metrics_dir,
-        experiment_name=experiment_name
+        experiment_name=experiment_name,
+        resume=bool(config.get("resume")),
     )
     
     print(f"\n[Output Directories]")
@@ -617,7 +545,7 @@ def train_nlp(
         device=device,
         off_diag_mode=config.get('off_diag_mode', 'mlp'),
         diag_scale=config.get('diag_scale', 1.0),
-        off_diag_scale=config.get('off_diag_scale', 0.5),
+        off_diag_scale=config.get('off_diag_scale', 1.0),
         off_diag_alpha_init=config.get('off_diag_alpha_init', 0.1),
         use_layer_bias=config.get('use_layer_bias', False),
         layer_bias_rank=config.get('layer_bias_rank', 16),
@@ -628,7 +556,7 @@ def train_nlp(
     )
     
     # Build head
-    vocab_size = tokenizer.vocab_size
+    vocab_size = len(tokenizer)
     head = Seq2SeqHead(config['d_model'], vocab_size).to(device)
     
     # Print model info
@@ -648,6 +576,7 @@ def train_nlp(
         top_k_samples=config.get('top_k_samples', 50),
         compute_topk_metrics=config.get('compute_topk_metrics', False),
         metrics_save_dir=metrics_dir,
+        kl_weight=config.get("kl_weight", 1e-4),
     )
     
     # Optimizer (include embedding layer)
@@ -655,7 +584,7 @@ def train_nlp(
     if hasattr(trainer, 'embedding'):
         all_params += list(trainer.embedding.parameters())
     
-    optimizer = optim.AdamW(
+    optimizer = optim.Adam(
         all_params,
         lr=config['lr'],
         weight_decay=config['weight_decay']
@@ -668,10 +597,12 @@ def train_nlp(
         eta_min=config['lr'] * 0.01
     )
     
-    # Training loop
     best_val_loss = float('inf')
-    
-    for epoch in range(1, config['epochs'] + 1):
+    start_epoch = 0
+    if config.get('resume'):
+        start_epoch, best_val_loss = load_checkpoint(model, optimizer, config['resume'], device,
+            components={'head': head, 'embedding': trainer.embedding}, scheduler=scheduler)
+    for epoch in range(start_epoch + 1, config['epochs'] + 1):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch}/{config['epochs']}")
         print(f"{'='*60}")
@@ -710,7 +641,9 @@ def train_nlp(
             best_val_loss = val_loss
             save_checkpoint(
                 model, optimizer, epoch, val_loss,
-                os.path.join(save_dir, 'best_model.pt')
+                os.path.join(save_dir, 'best_model.pt'),
+                components={'head': head, 'embedding': trainer.embedding}, scheduler=scheduler,
+                config=config, best_loss=best_val_loss
             )
             print(f"Best model saved (val_loss: {val_loss:.4f})")
         
@@ -718,7 +651,9 @@ def train_nlp(
         if epoch % config.get('save_every', 10) == 0:
             save_checkpoint(
                 model, optimizer, epoch, val_loss,
-                os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pt')
+                os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pt'),
+                components={'head': head, 'embedding': trainer.embedding}, scheduler=scheduler,
+                config=config, best_loss=best_val_loss
             )
     
     print(f"\nTraining completed! Best validation loss: {best_val_loss:.4f}")

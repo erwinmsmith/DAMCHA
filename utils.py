@@ -300,54 +300,55 @@ def get_lr(optimizer):
         return param_group['lr']
 
 
-def save_checkpoint(
-    model: nn.Module,
-    optimizer,
-    epoch: int,
-    loss: float,
-    path: str,
-    save_off_diag_params: bool = True,
-):
-    """
-    Save model checkpoint.
-    
-    Args:
-        model: Model to save
-        optimizer: Optimizer state
-        epoch: Current epoch
-        loss: Current loss value
-        path: Path to save checkpoint
-        save_off_diag_params: Whether to save off-diagonal parameters separately
-    """
+def save_checkpoint(model, optimizer, epoch, loss, path, save_off_diag_params=True,
+                    components=None, scheduler=None, config=None, best_loss=None):
+    """Save all trainable modules and training state for resumable experiments."""
+    from pathlib import Path
     checkpoint = {
-        'epoch': epoch,
+        'format_version': 2, 'epoch': epoch, 'loss': loss,
+        'best_loss': loss if best_loss is None else best_loss,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
+        'components': {name: module.state_dict() for name, module in (components or {}).items()},
+        'config': config or {},
+        'torch_rng_state': torch.get_rng_state(),
+        'python_rng_state': random.getstate(),
+        'numpy_rng_state': (np.random.get_state()[0], np.random.get_state()[1].tolist(),
+                            *np.random.get_state()[2:]),
     }
-    
-    # Save off-diagonal parameters separately if available
+    if torch.cuda.is_available():
+        checkpoint['cuda_rng_state'] = torch.cuda.get_rng_state_all()
+    if scheduler is not None:
+        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
     if save_off_diag_params and hasattr(model, 'get_off_diag_params'):
-        off_diag_params = model.get_off_diag_params()
-        checkpoint['off_diag_params'] = off_diag_params
-        
-        # Also save to a separate file for easy inspection
-        import os
-        off_diag_path = path.replace('.pt', '_off_diag_params.pt')
-        torch.save(off_diag_params, off_diag_path)
-    
-    torch.save(checkpoint, path)
+        checkpoint['off_diag_params'] = model.get_off_diag_params()
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + '.tmp')
+    torch.save(checkpoint, temporary)
+    temporary.replace(destination)
 
 
-def load_checkpoint(
-    model: nn.Module,
-    optimizer,
-    path: str,
-    device: str = 'cuda'
-):
-    """Load model checkpoint."""
-    checkpoint = torch.load(path, map_location=device)
+def load_checkpoint(model, optimizer, path, device='cpu', components=None, scheduler=None):
+    """Restore a complete checkpoint; require requested training components."""
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    for name in (components or {}):
+        if name not in checkpoint.get('components', {}):
+            raise ValueError(f'Checkpoint does not contain the {name} component')
+    if scheduler is not None and 'scheduler_state_dict' not in checkpoint:
+        raise ValueError('Checkpoint does not contain scheduler state')
     model.load_state_dict(checkpoint['model_state_dict'])
+    for name, module in (components or {}).items():
+        module.load_state_dict(checkpoint['components'][name])
     if optimizer is not None:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    return checkpoint['epoch'], checkpoint['loss']
+    if scheduler is not None:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    if 'torch_rng_state' in checkpoint:
+        torch.set_rng_state(checkpoint['torch_rng_state'].cpu())
+        random.setstate(checkpoint['python_rng_state'])
+        state = checkpoint['numpy_rng_state']
+        np.random.set_state((state[0], np.asarray(state[1], dtype=np.uint32), *state[2:]))
+    if torch.cuda.is_available() and 'cuda_rng_state' in checkpoint:
+        torch.cuda.set_rng_state_all([state.cpu() for state in checkpoint['cuda_rng_state']])
+    return checkpoint['epoch'], checkpoint.get('best_loss', checkpoint['loss'])

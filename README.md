@@ -1,169 +1,121 @@
-# Data-Adaptive Mahalanobis Metric Learning for Cross-Head Attention in Transformers
+# DAMCHA
 
-A PyTorch implementation of DAMCHA, a novel attention mechanism that replaces standard Q/K attention with learnable M-matrix based computation.
+**Data-Adaptive Mahalanobis Metric Learning for Cross-Head Attention in Transformers**
 
-## Overview
+**Accepted at NeurIPS 2026**
 
-DAMCHA introduces **M-based Attention**, which replaces the standard Q/K attention computation:
 
-- **Standard Attention**: `softmax(Q @ K.T / sqrt(d)) @ V`
-- **DAMCHA Attention**: `softmax(X @ M @ X.T / sqrt(d)) @ V`
+[Documentation](https://erwinmsmith.github.io/DAMCHA/) · [Method](docs/method.md) · [Experiments](docs/experiments.md) · [Citation](CITATION.bib)
 
-The M matrix captures cross-head interactions through a structured block design:
-- **Diagonal blocks**: Per-head attention patterns
-- **Off-diagonal blocks**: Cross-head interactions (learnable linear combinations)
+DAMCHA learns an input-dependent cross-head metric for Transformer attention. A metric generator maps the input context to a full matrix, and each head uses the sum of its block row to compute attention. Sharing the generator across the stack gives every layer access to the same family of adaptive metrics.
 
-### Multi-head M Mode
-
-In multi-head M mode, off-diagonal blocks are **aggregated to diagonal blocks** before extracting per-head M matrices:
-
-```
-For each head h:
-  M_h = (M_diag[h] + sum_{j!=h}(M[h,j] + M[j,h])) / (2*n_heads - 1)
+```text
+Input context → mean pooling → metric generator fθ → M(X)
+                                                   ↓ RowSum
+                          head metrics → attention → concatenate → output
 ```
 
-This allows cross-head information to flow into each head's attention computation.
-
-## Key Features
-
-- **Flexible Attention Modes**: Standard Q/K/V, M0-only, MLP-based M generation
-- **Structured M Matrix**: Block-diagonal with learnable off-diagonal interactions
-- **Multi-head M Attention**: Aggregate off-diagonal to diagonal, then extract per-head M
-- **Off-diagonal Modes**: Direct MLP, linear combination, or Bayesian inference
-- **Per-layer Bias**: Low-rank factorized layer-specific M adjustments
-- **CV & NLP Support**: Image reconstruction and sequence-to-sequence tasks
-
-## Project Structure
-
-```
-DAMCHA/
-├── main.py                    # Main entry point
-├── train.py                   # CV training (image reconstruction)
-├── train_nlp.py               # NLP training (seq2seq)
-├── utils.py                   # Utilities (Patchify, MaskGenerator)
-├── visualization.py           # Metrics and visualization
-├── models/
-│   ├── __init__.py
-│   ├── m_attention.py         # Core: M-based attention module
-│   ├── transformer_damcha.py  # DAMCHA Transformer architecture
-│   └── vit.py                 # Vision Transformer with DAMCHA
-└── data/
-    ├── __init__.py
-    ├── datasets.py            # CV datasets (CIFAR, MNIST)
-    └── datasets_nlp.py        # NLP datasets (WMT, CommonGen)
-```
-
-## Datasets
-
-### CV Datasets
-CIFAR-10 and CIFAR-100 are downloaded automatically via `torchvision` on first run and cached under `data/rawdata/`.
-
-### NLP Datasets
-
-| Dataset | Task | Source |
-|---------|------|--------|
-| **WMT** | Chinese→English Machine Translation | [ModelScope – iic/WMT-Chinese-to-English-Machine-Translation-Training-Corpus](https://www.modelscope.cn/datasets/iic/WMT-Chinese-to-English-Machine-Translation-Training-Corpus) |
-| **CommonGen** | Concept-to-Text Generation | [ModelScope – allenai/common_gen](https://www.modelscope.cn/datasets/allenai/common_gen) |
-
-Download the raw files and place them under the corresponding directories:
-
-```
-data/rawdata/WMT/        # WMT translation corpus
-data/rawdata/CommonGen/  # CommonGen parquet files
-```
+This repository provides the DAMCHA attention module, decoder-only Transformers, a Vision Transformer, image reconstruction and conditional text training, attention baselines, and evaluation tools.
 
 ## Installation
 
-```bash
-# Create environment
-conda create -n damcha python=3.10
-conda activate damcha
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-## Quick Start
-
-### CV Tasks (Image Generation)
+Use Python 3.10 or newer and a matching PyTorch/torchvision installation for your device.
 
 ```bash
-# Standard Transformer baseline
-python main.py --dataset cifar10 --epochs 50
-
-# DAMCHA with shared MLP
-python main.py --dataset cifar10 --epochs 50 --use_M --use_mlp --share_mlp
-
-# DAMCHA with multi-head M
-python main.py --dataset cifar10 --epochs 50 --use_M --use_mlp --share_mlp --use_multihead_M
-
-# DAMCHA with linear combination off-diagonal
-python main.py --dataset cifar10 --epochs 50 --use_M --use_mlp --share_mlp --off_diag_mode linear_comb
+git clone https://github.com/erwinmsmith/DAMCHA.git
+cd DAMCHA
+python -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
 ```
 
-### NLP Tasks
-
-```bash
-# Machine Translation (WMT)
-python main.py --dataset wmt --epochs 50 --use_M --use_mlp --share_mlp
-
-# Concept-to-Text (CommonGen)
-python main.py --dataset commongen --epochs 50 --use_M --use_mlp --share_mlp
-```
-
-## Key Hyperparameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--d_model` | 128 | Model dimension |
-| `--n_heads` | 8 | Number of attention heads |
-| `--n_layers` | 4 | Number of decoder layers |
-| `--use_M` | False | Enable M-based attention |
-| `--use_mlp` | False | Use MLP for M generation |
-| `--share_mlp` | False | Share MLP across layers |
-| `--off_diag_mode` | 'mlp' | 'mlp', 'linear_comb', 'bayesian' |
-| `--off_diag_scale` | 0.5 | Off-diagonal block scale |
-| `--use_multihead_M` | False | Per-head M matrices |
-
-## Architecture
-
-### M-based Attention
-
-```
-Standard:  Attn = softmax((X @ W_q) @ (X @ W_k).T / sqrt(d)) @ V
-DAMCHA:    Attn = softmax(X @ M @ X.T / sqrt(d)) @ V
-```
-
-### Structured M Matrix
-
-```
-M = | M^(1)   M^(1,2) ... M^(1,H) |
-    | M^(2,1) M^(2)   ... M^(2,H) |
-    | ...     ...     ... ...     |
-    | M^(H,1) M^(H,2) ... M^(H)   |
-
-Off-diagonal: M^(i,j) = sum_k(alpha_{i,j,k} * M^(k))
-```
-
-## API
+## Quick start
 
 ```python
-from models import TransformerPC, VisionTransformer
+import torch
+from models import TransformerPC
 
-# Create DAMCHA Transformer
 model = TransformerPC(
-    d_model=128,
-    n_heads=8,
-    n_layers=4,
-    use_M=True,
-    use_mlp=True,
-    share_mlp=True,
-    off_diag_mode='linear_comb',
+    d_model=128, n_heads=8, d_ff=256, n_layers=4,
+    use_M=True, use_mlp=True, share_mlp=True,
+    mlp_hidden=(256, 512),
 )
-
-# Get M matrices
-m_matrices = model.get_M_matrices()
-
-# Get off-diagonal parameters
-off_diag_params = model.get_off_diag_params()
+x = torch.randn(2, 16, 128)
+y = model(x)  # [batch, tokens, features]
 ```
+
+Run the existing reconstruction and text workflows:
+
+```bash
+# CIFAR-10 masked image reconstruction; dataset downloads automatically.
+python main.py --dataset cifar10 --use_M --use_mlp --share_mlp
+
+# WMT14 English → German; prepare the parallel files described in the docs.
+python main.py --dataset wmt --use_M --use_mlp --share_mlp
+
+# CommonGen concept-to-text generation.
+python main.py --dataset commongen --use_M --use_mlp --share_mlp
+
+# Inspect all 28 experiment commands before running the suite.
+bash scripts/run_all_experiments.sh --dry-run
+```
+
+See [Getting started](docs/getting-started.md) for dataset layouts, device selection and checkpoint resume. [Experiments](docs/experiments.md) records the paper settings alongside the repository workflows.
+
+## Method
+
+For `d = h × dh`, the generator produces `M(X)` with shape `[batch, d, d]`. Partition it into `h × h` blocks of shape `[dh, dh]`:
+
+```text
+M(X)  = fθ(mean(X))
+mᵢ(X) = Σⱼ Mᵢⱼ(X)
+Aᵢ(X) = softmax(Xᵢ mᵢ(X) Xᵢᵀ / √dh)
+Oᵢ(X) = Aᵢ(X) Vᵢ
+```
+
+The implementation follows the head-slice formulation in Appendix D. Causal decoding uses a prefix mean for each query; noncausal ViT attention uses the full-sequence mean. The full metric is unconstrained, with optional structural and low-rank ablations. See [Method](docs/method.md) for tensor shapes and code correspondence.
+
+## Repository layout
+
+```text
+models/          Attention, decoder, ViT and baseline modules
+data/            Dataset loading and tokenization
+scripts/         Experiment suite, result export and profiling
+tests/           Numerical, causality and training regression tests
+docs/            Documentation source
+.github/         Test and documentation deployment workflows
+main.py          Training CLI
+train.py         Image reconstruction training
+train_nlp.py     Conditional text training
+evaluation_nlp.py NLP evaluation
+utils.py         Patch embedding, masking and checkpoints
+visualization.py Image metrics and visualizations
+CITATION.cff     GitHub citation metadata
+CITATION.bib     Paper citation
+```
+
+Datasets, checkpoints, logs and generated outputs are created at runtime and excluded from version control.
+
+## Development
+
+```bash
+pytest -q
+mkdocs build --strict
+mkdocs serve
+```
+
+## Citation
+
+```bibtex
+@inproceedings{duan2026damcha,
+  title     = {Data-Adaptive Mahalanobis Metric Learning for Cross-Head Attention in Transformers},
+  author    = {Duan, Zhenke and Li, Xin and Pan, Jiqun and {Dong Xiaofei} and Ning, Hanwen and Song, Xinyuan},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2026},
+  note      = {Accepted at NeurIPS 2026}
+}
+```
+
+## License
+
+[MIT](LICENSE).

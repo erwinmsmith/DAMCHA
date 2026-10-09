@@ -83,7 +83,7 @@ class THAAttention(nn.Module):
         # Pre mixing: H last -> linear -> H second
         scores = self.pre_proj(scores.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         if attn_mask is not None:
-            scores = scores + attn_mask.unsqueeze(0).unsqueeze(0)
+            scores = scores + (attn_mask[:, None] if attn_mask.ndim == 3 else attn_mask)
         attn = F.softmax(scores, dim=-1)
         attn = self.post_proj(attn.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         attn = self.drop(attn)
@@ -130,7 +130,7 @@ class DCMHAAttention(nn.Module):
         gate = torch.sigmoid(self.gate_proj(x)).permute(0, 2, 1).unsqueeze(-1)  # [B,H,T,1]
         scores_final = gate * composed + (1.0 - gate) * scores
         if attn_mask is not None:
-            scores_final = scores_final + attn_mask.unsqueeze(0).unsqueeze(0)
+            scores_final = scores_final + (attn_mask[:, None] if attn_mask.ndim == 3 else attn_mask)
         attn = self.drop(F.softmax(scores_final, dim=-1))
         out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, T, d)
         return self.out_proj(out)
@@ -165,7 +165,7 @@ class CollaborativeAttention(nn.Module):
         V = self.W_v(x).view(B, T, H, d_h).transpose(1, 2)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_h)
         if attn_mask is not None:
-            scores = scores + attn_mask.unsqueeze(0).unsqueeze(0)
+            scores = scores + (attn_mask[:, None] if attn_mask.ndim == 3 else attn_mask)
         attn = self.drop(F.softmax(scores, dim=-1))
         out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, T, d)
         return self.out_proj(out)
@@ -213,7 +213,9 @@ class MMAAttention(nn.Module):
         outs = []
         for h in range(H):
             s = base[:, h] + self._mask(self.head_groups[h], T, x.device).unsqueeze(0)
-            a = self.drop(F.softmax(s, dim=-1))
+            if attn_mask is not None:
+                s = s + attn_mask
+            a = self.drop(F.softmax(s.masked_fill(torch.isneginf(s).all(-1, keepdim=True), 0), dim=-1))
             outs.append(torch.matmul(a, V[:, h]))
         out = torch.stack(outs, dim=2).view(B, T, d)
         return self.out_proj(out)
@@ -261,7 +263,7 @@ class MoAAttention(nn.Module):
         Q_e = Q_all.permute(2, 0, 1, 3).reshape(n_e * B, T, d_h)
         K_e = K_all.permute(2, 0, 1, 3).reshape(n_e * B, T, d_h)
         V_e = V_all.permute(2, 0, 1, 3).reshape(n_e * B, T, d_h)
-        sc = torch.bmm(Q_e, K_e.transpose(1, 2)) / math.sqrt(d_h) + causal.unsqueeze(0)
+        sc = torch.bmm(Q_e, K_e.transpose(1, 2)) / math.sqrt(d_h) + (causal.repeat(n_e, 1, 1) if causal.ndim == 3 else causal.unsqueeze(0))
         at = self.drop(F.softmax(sc, dim=-1))
         out_e = torch.bmm(at, V_e).view(n_e, B, T, d_h).permute(1, 2, 0, 3)  # [B,T,n_e,d_h]
         # Gather top-k, gate, flatten
@@ -294,8 +296,10 @@ class BaselineDecoderLayer(nn.Module):
         self.ln2 = nn.LayerNorm(d_model)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, padding_mask=None):
         mask = _causal(x.size(1), x.device)
+        if padding_mask is not None:
+            mask = mask.expand(x.size(0), -1, -1).masked_fill(~padding_mask[:, None, :].bool(), float('-inf'))
         x = self.ln1(x + self.drop(self.self_attn(x, attn_mask=mask)))
         x = self.ln2(x + self.drop(self.ff(x)))
         return x
@@ -311,10 +315,10 @@ class BaselineDecoder(nn.Module):
         ])
         self.pe = _SinPE(d_model)
 
-    def forward(self, x):
+    def forward(self, x, padding_mask=None):
         x = self.pe(x)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, padding_mask=padding_mask)
         return x
 
     def get_M_matrices(self): return []
@@ -339,8 +343,8 @@ class BaselineTransformer(nn.Module):
             baseline, d_model, n_heads, d_ff, n_layers, dropout, **attn_kwargs
         )
 
-    def forward(self, x):
-        return self.decoder(x)
+    def forward(self, x, padding_mask=None):
+        return self.decoder(x, padding_mask=padding_mask)
 
     def get_M_matrices(self):        return []
     def get_M0_matrices(self):       return []

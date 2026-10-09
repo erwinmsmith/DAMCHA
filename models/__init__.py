@@ -1,5 +1,5 @@
 """
-DAMCHA: Dynamic Attention with M-matrix Cross-Head Aggregation
+DAMCHA: Data-Adaptive Mahalanobis Cross-Head Attention
 
 Core models package containing:
 - M-based attention mechanism (replaces Q/K with learnable M matrix)
