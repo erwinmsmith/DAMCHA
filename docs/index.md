@@ -6,6 +6,7 @@
 
 **Data-Adaptive Mahalanobis Metric Learning for Cross-Head Attention in Transformers**
 
+[![arXiv](https://img.shields.io/badge/arXiv-2610.13261-b31b1b.svg?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2610.13261)
 
 [Get started](getting-started.md) · [Explore the method](method.md) · [View the code](https://github.com/erwinmsmith/DAMCHA) · [Cite the paper](citation.md)
 

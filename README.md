@@ -4,6 +4,7 @@
 
 **Accepted at NeurIPS 2026**
 
+[![arXiv](https://img.shields.io/badge/arXiv-2610.13261-b31b1b.svg?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2610.13261)
 
 [Documentation](https://erwinmsmith.github.io/DAMCHA/) · [Method](docs/method.md) · [Experiments](docs/experiments.md) · [Citation](CITATION.bib)
 
@@ -112,6 +113,11 @@ mkdocs serve
   author    = {Duan, Zhenke and Li, Xin and Pan, Jiqun and {Dong Xiaofei} and Ning, Hanwen and Song, Xinyuan},
   booktitle = {Advances in Neural Information Processing Systems},
   year      = {2026},
+  eprint    = {2610.13261},
+  archivePrefix = {arXiv},
+  primaryClass = {cs.LG},
+  doi       = {10.48550/arXiv.2610.13261},
+  url       = {https://arxiv.org/abs/2610.13261},
   note      = {Accepted at NeurIPS 2026}
 }
 ```

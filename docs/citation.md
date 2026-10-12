@@ -7,8 +7,8 @@
 | Publication field | Value |
 | --- | --- |
 | Conference | NeurIPS 2026 |
-| Paper URL | |
-| DOI | |
+| Paper URL | [arXiv:2610.13261](https://arxiv.org/abs/2610.13261) |
+| arXiv DOI | [10.48550/arXiv.2610.13261](https://doi.org/10.48550/arXiv.2610.13261) |
 
 ## BibTeX
 
@@ -18,11 +18,16 @@
   author    = {Duan, Zhenke and Li, Xin and Pan, Jiqun and {Dong Xiaofei} and Ning, Hanwen and Song, Xinyuan},
   booktitle = {Advances in Neural Information Processing Systems},
   year      = {2026},
+  eprint    = {2610.13261},
+  archivePrefix = {arXiv},
+  primaryClass = {cs.LG},
+  doi       = {10.48550/arXiv.2610.13261},
+  url       = {https://arxiv.org/abs/2610.13261},
   note      = {Accepted at NeurIPS 2026}
 }
 ```
 
-GitHub's **Cite this repository** action reads `CITATION.cff`. The paper URL and DOI fields above are reserved for the final publication record.
+GitHub's **Cite this repository** action reads `CITATION.cff`. The paper URL and DOI above refer to the arXiv version.
 
 ## Software
 
